@@ -169,74 +169,110 @@ def fetch_whois_info(domain):
         print(f"[+] WHOIS data retrieved. Registrar: {whois_data['registrar']}, Nameservers: {ns_count}")
         
     except subprocess.TimeoutExpired:
-        print("[-] WHOIS lookup timed out.")
+        print("[-] WHOIS query timed out.")
     except KeyboardInterrupt:
-        print("\n[!] User interrupted WHOIS lookup (Ctrl+C).")
+        print("\n[!] User interrupted WHOIS query (Ctrl+C). Skipping...")
     except Exception as e:
         print(f"[-] Error running WHOIS: {e}")
-    
+        
     return whois_data
 
-def fetch_dns_records(domain):
-    """
-    Fetches DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME) using 'dig'.
-    Also analyzes SPF, DKIM, and DMARC policies from TXT records.
-    """
-    print(f"[*] Querying DNS records for {domain}...")
-    dns_data = {
-        "A": [], "AAAA": [], "MX": [], "NS": [], "TXT": [],
-        "SOA": [], "CNAME": [],
-        "spf": None, "dmarc": None, "dkim": None,
-        "security_notes": []
-    }
+
+# ─────────────────────────────────────────────
+# ProjectDiscovery Pipeline Modules
+# ─────────────────────────────────────────────
+
+
+def fetch_wayback_urls(domain):
+    print(f"[*] Querying Wayback Machine for exposed files on {domain}...")
+    urls = []
+    # Using CDX API to find juicy files (.env, .sql, .bak, .config, .json, .zip, etc.)
+    wayback_url = f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*&collapse=urlkey&output=json&fl=original&filter=statuscode:200&filter=mimetype:text/plain|application/json|application/zip|application/x-sql"
+    try:
+        response = requests.get(wayback_url, headers=HEADERS, timeout=20)
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                if len(data) > 1:
+                    for row in data[1:]:
+                        urls.append(row[0])
+            except ValueError:
+                print("[-] Wayback Machine returned invalid JSON.")
+        else:
+            print(f"[-] Wayback Machine returned a non-200 status code: {response.status_code}")
+    except requests.exceptions.Timeout:
+        print("[-] Wayback Machine query timed out.")
+    except Exception as e:
+        print(f"[-] Error querying Wayback Machine: {e}")
+
+    # Basic Regex filter for sensitive extensions
+    sensitive_exts = ('.env', '.sql', '.bak', '.config', '.json', '.pem', '.key', '.yml', '.yaml', '.log', '.zip', '.tar.gz')
+    juicy_urls = [u for u in urls if any(u.lower().endswith(ext) or ext+"?" in u.lower() for ext in sensitive_exts)]
     
+    if juicy_urls:
+        print(f"[+] Successfully extracted {len(juicy_urls)} archived URLs from Wayback Machine.")
+    else:
+        print("[-] No sensitive archived files found on Wayback Machine.")
+        
+    return juicy_urls
+
+def fetch_open_ports(ip):
+    print(f"[*] Querying Shodan InternetDB for ports on {ip}...")
+    ports = []
+    cves = []
+    url = f"https://internetdb.shodan.io/{ip}"
+    
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            ports = data.get('ports', [])
+            cves = data.get('vulns', [])
+            print(f"[+] Found {len(ports)} open ports and {len(cves)} vulnerabilities.")
+        elif response.status_code == 404:
+            print(f"[-] No Shodan data found for this IP.")
+        else:
+            print(f"[-] Shodan API returned status code: {response.status_code}")
+    except requests.exceptions.Timeout:
+        print("[-] Shodan query timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] User interrupted Shodan scan (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] Error querying Shodan: {e}")
+        
+    return ports, cves
+
+def fetch_dns_records(domain):
+    print(f"[*] Querying DNS records for {domain}...")
+    dns_data = {"A": [], "AAAA": [], "MX": [], "NS": [], "TXT": [], "SOA": [], "CNAME": [], "security_notes": []}
     if not shutil.which("dig"):
-        print("[-] 'dig' command not found. Skipping DNS module.")
+        print("[-] 'dig' command not found. Skipping DNS map module.")
         return dns_data
     
     record_types = ["A", "AAAA", "MX", "NS", "TXT", "SOA", "CNAME"]
-    
     for rtype in record_types:
         try:
             result = subprocess.run(
-                ["dig", "+short", domain, rtype],
-                capture_output=True, text=True, timeout=15
+                ["dig", "+short", rtype, domain],
+                capture_output=True, text=True, timeout=10
             )
-            lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             dns_data[rtype] = lines
-        except subprocess.TimeoutExpired:
-            print(f"[-] DNS query for {rtype} records timed out.")
-        except Exception as e:
-            print(f"[-] Error querying {rtype} records: {e}")
-    
-    # Analyze SPF, DMARC, DKIM from TXT records
-    for txt_record in dns_data["TXT"]:
-        if "v=spf1" in txt_record.lower():
-            dns_data["spf"] = txt_record
-    
-    # Check DMARC via _dmarc subdomain
+        except Exception:
+            continue
+            
+    # Simple Security Checks on DNS
+    txt_records = " ".join(dns_data.get("TXT", [])).lower()
+    if "spf1" not in txt_records:
+        dns_data["security_notes"].append("⚠️ No SPF record found — high risk of email spoofing")
+        
     try:
-        result = subprocess.run(
-            ["dig", "+short", f"_dmarc.{domain}", "TXT"],
-            capture_output=True, text=True, timeout=15
-        )
-        dmarc_out = result.stdout.strip()
-        if dmarc_out:
-            dns_data["dmarc"] = dmarc_out
+        dmarc_result = subprocess.run(["dig", "+short", "TXT", f"_dmarc.{domain}"], capture_output=True, text=True, timeout=10)
+        if not dmarc_result.stdout.strip():
+            dns_data["security_notes"].append("⚠️ No DMARC record found — phishing risk")
     except Exception:
         pass
-    
-    # Security analysis
-    if not dns_data["spf"]:
-        dns_data["security_notes"].append("⚠️ No SPF record found — domain is vulnerable to email spoofing")
-    elif "+all" in (dns_data["spf"] or ""):
-        dns_data["security_notes"].append("⚠️ SPF uses +all (permissive) — effectively no protection")
-    
-    if not dns_data["dmarc"]:
-        dns_data["security_notes"].append("⚠️ No DMARC record found — phishing risk")
-    elif "p=none" in (dns_data["dmarc"] or "").lower():
-        dns_data["security_notes"].append("⚠️ DMARC policy is 'none' — monitoring only, no enforcement")
-    
+
     total = sum(len(v) for k, v in dns_data.items() if k in record_types)
     print(f"[+] DNS enumeration complete. {total} total records found.")
     if dns_data["security_notes"]:
@@ -246,22 +282,12 @@ def fetch_dns_records(domain):
     return dns_data
 
 def fetch_emails_theharvester(domain):
-    """
-    Uses theHarvester to passively collect email addresses, hosts, and IPs
-    from search engines and public data sources.
-    """
     print(f"[*] Running theHarvester for email/host enumeration on {domain}...")
-    harvest_data = {
-        "emails": [],
-        "hosts": [],
-        "ips": []
-    }
-    
+    harvest_data = {"emails": [], "hosts": [], "ips": []}
     if not shutil.which("theHarvester"):
         print("[-] 'theHarvester' command not found. Skipping email harvesting module.")
         return harvest_data
     
-    # Use a temp file for JSON output
     tmp_dir = tempfile.mkdtemp(prefix="ghostdorks_")
     output_base = os.path.join(tmp_dir, "harvest")
     
@@ -272,20 +298,20 @@ def fetch_emails_theharvester(domain):
             capture_output=True, text=True, timeout=120
         )
         
-        # theHarvester saves to <output_base>.json
         json_path = output_base + ".json"
-        if os.path.exists(json_path):
-            with open(json_path, 'r') as f:
-                data = json.load(f)
+        local_json_path = "harvest.json"
+        target_json = None
+        if os.path.exists(json_path): target_json = json_path
+        elif os.path.exists(local_json_path): target_json = local_json_path
             
+        if target_json:
+            with open(target_json, 'r') as f:
+                data = json.load(f)
             harvest_data["emails"] = sorted(set(data.get("emails", [])))
             harvest_data["hosts"] = sorted(set(data.get("hosts", [])))
             harvest_data["ips"] = sorted(set(data.get("ips", [])))
-            
-            print(f"[+] theHarvester found: {len(harvest_data['emails'])} emails, "
-                  f"{len(harvest_data['hosts'])} hosts, {len(harvest_data['ips'])} IPs")
+            print(f"[+] theHarvester found: {len(harvest_data['emails'])} emails, {len(harvest_data['hosts'])} hosts, {len(harvest_data['ips'])} IPs")
         else:
-            # Fallback: parse stdout for emails
             print("[-] theHarvester JSON output not found, parsing stdout...")
             email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
             found_emails = email_pattern.findall(result.stdout)
@@ -294,131 +320,36 @@ def fetch_emails_theharvester(domain):
                 print(f"[+] Parsed {len(harvest_data['emails'])} emails from stdout.")
             else:
                 print("[-] No emails found.")
-    
-    except subprocess.TimeoutExpired:
-        print("[-] theHarvester timed out after 120 seconds.")
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted theHarvester (Ctrl+C). Skipping...")
     except Exception as e:
         print(f"[-] Error running theHarvester: {e}")
     finally:
-        # Clean up temp files
         try:
             import shutil as sh
             sh.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
-    
+            
     return harvest_data
 
-def fetch_reverse_ip(ip_address):
-    """
-    Performs a reverse IP lookup to find other domains hosted on the same IP.
-    Uses the HackerTarget API (same API already in use for subdomains).
-    """
-    print(f"[*] Running reverse IP lookup for {ip_address}...")
-    co_hosted = []
-    
-    if not ip_address:
-        return co_hosted
-    
-    url = f"https://api.hackertarget.com/reverseiplookup/?q={ip_address}"
+def fetch_reverse_ip(ip):
+    print(f"[*] Running reverse IP lookup for {ip}...")
+    domains = []
+    url = f"https://api.hackertarget.com/reverseiplookup/?q={ip}"
     try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        if response.status_code == 200:
-            if "error" not in response.text.lower() and "api count" not in response.text.lower():
-                lines = response.text.strip().split('\n')
-                co_hosted = sorted(set([l.strip().lower() for l in lines if l.strip() and l.strip() != "No records found"]))
-                if co_hosted:
-                    print(f"[+] Found {len(co_hosted)} domains co-hosted on {ip_address}.")
-                else:
-                    print(f"[-] No co-hosted domains found.")
-            else:
-                print(f"[-] HackerTarget API limit reached for reverse IP lookup.")
-        else:
-            print(f"[-] Reverse IP lookup returned status code: {response.status_code}")
-    except requests.exceptions.Timeout:
-        print("[-] Reverse IP lookup timed out.")
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted reverse IP lookup (Ctrl+C).")
-    except Exception as e:
-        print(f"[-] Error during reverse IP lookup: {e}")
-    
-    return co_hosted
-
-def fetch_wayback_urls(domain):
-    """
-    Queries the Wayback Machine CDX API for highly sensitive archived files.
-    """
-    print(f"[*] Querying Wayback Machine for exposed files on {domain}...")
-    extensions = "(env|sql|bak|db|config|pem|rsa|ini|json|log|yml|yaml|txt)"
-    url = f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=txt&fl=original&collapse=urlkey&filter=original:.*\\.{extensions}$"
-    
-    juicy_urls = set()
-    try:
-        # Increased to 45 seconds
-        response = requests.get(url, headers=HEADERS, timeout=45)
-        if response.status_code == 200:
-            lines = response.text.split('\n')
-            for line in lines:
-                line = line.strip()
-                if line:
-                    juicy_urls.add(line)
-                    # Cap at 500 to prevent the HTML dashboard from crashing
-                    if len(juicy_urls) >= 500:
-                        print("[!] Reached maximum limit of 500 Wayback URLs. Truncating.")
-                        break
-            if juicy_urls:
-                print(f"[+] Successfully extracted {len(juicy_urls)} archived URLs from Wayback Machine.")
-        else:
-            print(f"[-] Wayback Machine returned a non-200 status code: {response.status_code}")
-    except requests.exceptions.Timeout:
-        print("[-] Wayback Machine query timed out. Skipping.")
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted Wayback Machine scan (Ctrl+C). Skipping this module...")
-    except Exception as e:
-        print(f"[-] Error querying Wayback Machine: {e}")
-        
-    return sorted(list(juicy_urls))
-
-def fetch_open_ports(ip_address):
-    """
-    Passively checks a target IP for open ports and vulnerabilities 
-    using the free Shodan InternetDB API.
-    """
-    print(f"[*] Querying Shodan InternetDB for ports on {ip_address}...")
-    url = f"https://internetdb.shodan.io/{ip_address}"
-    
-    ports = []
-    cves = []
-    
-    try:
-        # We use the exact same resilient request structure
         response = requests.get(url, headers=HEADERS, timeout=15)
-        
         if response.status_code == 200:
-            data = response.json()
-            ports = data.get('ports', [])
-            cves = data.get('vulns', []) # Grabs known CVEs if Shodan has them!
-            print(f"[+] Found {len(ports)} open ports and {len(cves)} vulnerabilities.")
-            
-        elif response.status_code == 404:
-            print(f"[-] No Shodan data found for this IP.")
+            lines = response.text.splitlines()
+            if len(lines) > 0 and "No DNS A records found" not in lines[0] and "API count exceeded" not in lines[0]:
+                domains = [line.strip() for line in lines if line.strip()]
+                print(f"[+] Found {len(domains)} domains co-hosted on {ip}.")
+            else:
+                print(f"[-] No co-hosted domains found for {ip} or API limit reached.")
         else:
-            print(f"[-] Shodan API returned status code: {response.status_code}")
-            
-    except requests.exceptions.Timeout:
-        print("[-] Shodan query timed out.")
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted Shodan scan (Ctrl+C).")
+            print(f"[-] HackerTarget API returned status code: {response.status_code}")
     except Exception as e:
-        print(f"[-] Error querying Shodan: {e}")
-        
-    return ports, cves
+        print(f"[-] Error running reverse IP lookup: {e}")
+    return domains
 
-# ─────────────────────────────────────────────
-# ProjectDiscovery Pipeline Modules
-# ─────────────────────────────────────────────
 
 def run_subfinder(domain):
     """
@@ -465,9 +396,7 @@ def run_dnsx(subdomains):
         print("[-] 'dnsx' not found. Skipping DNS validation.")
         return resolved, takeover_candidates
     try:
-        # Write subdomains to a temp file
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
-                                          prefix='ghostdorks_', delete=False)
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_', delete=False)
         tmp.write('\n'.join(subdomains))
         tmp.close()
         proc = subprocess.run(
@@ -486,12 +415,10 @@ def run_dnsx(subdomains):
                 if a_records:
                     resolved.append({"host": host, "ips": a_records, "cname": cname})
                 elif cname:
-                    # CNAME with no A record = potential takeover
                     takeover_candidates.append({"host": host, "cname": cname})
             except json.JSONDecodeError:
                 continue
-        print(f"[+] dnsx resolved {len(resolved)} live hosts, "
-              f"{len(takeover_candidates)} potential takeover candidates.")
+        print(f"[+] dnsx resolved {len(resolved)} live hosts, {len(takeover_candidates)} potential takeover candidates.")
     except subprocess.TimeoutExpired:
         print("[-] dnsx timed out.")
     except KeyboardInterrupt:
@@ -515,13 +442,11 @@ def run_naabu(resolved_hosts, rate=1000):
         return port_results
     try:
         hosts = [h["host"] for h in resolved_hosts]
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
-                                          prefix='ghostdorks_naabu_', delete=False)
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_naabu_', delete=False)
         tmp.write('\n'.join(hosts))
         tmp.close()
         proc = subprocess.run(
-            ["naabu", "-list", tmp.name, "-top-ports", "1000",
-             "-rate", str(rate), "-json", "-silent", "-exclude-cdn"],
+            ["naabu", "-list", tmp.name, "-top-ports", "1000", "-rate", str(rate), "-json", "-silent", "-exclude-cdn"],
             capture_output=True, text=True, timeout=300
         )
         os.unlink(tmp.name)
@@ -546,8 +471,7 @@ def run_naabu(resolved_hosts, rate=1000):
 
 def run_httpx(resolved_hosts, naabu_results=None):
     """
-    Probes hosts for live HTTP/HTTPS services, grabbing title, status,
-    server header, tech stack, and TLS info.
+    Probes hosts for live HTTP/HTTPS services, grabbing title, status, server header, tech stack, and TLS info.
     ACTIVE — sends HTTP requests (looks like normal browser traffic).
     Only called when --active flag is set.
     """
@@ -559,23 +483,16 @@ def run_httpx(resolved_hosts, naabu_results=None):
         print("[-] 'httpx' not found. Skipping.")
         return http_hosts
     try:
-        # Build input: prefer naabu host:port combos if available
         if naabu_results:
-            targets = list(set(
-                f"{r['host']}:{r['port']}" for r in naabu_results
-                if r['port'] in [80, 443, 8080, 8443, 8000, 8888, 3000, 5000]
-            ))
+            targets = list(set(f"{r['host']}:{r['port']}" for r in naabu_results if r['port'] in [80, 443, 8080, 8443, 8000, 8888, 3000, 5000]))
         else:
             targets = [h["host"] for h in resolved_hosts]
 
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
-                                          prefix='ghostdorks_httpx_', delete=False)
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_httpx_', delete=False)
         tmp.write('\n'.join(targets))
         tmp.close()
         proc = subprocess.run(
-            ["httpx", "-l", tmp.name,
-             "-status-code", "-title", "-server", "-tech-detect",
-             "-follow-redirects", "-json", "-silent", "-threads", "50"],
+            ["httpx", "-l", tmp.name, "-status-code", "-title", "-server", "-tech-detect", "-follow-redirects", "-json", "-silent", "-threads", "50"],
             capture_output=True, text=True, timeout=300
         )
         os.unlink(tmp.name)
@@ -604,11 +521,11 @@ def run_httpx(resolved_hosts, naabu_results=None):
         print(f"[-] httpx error: {e}")
     return http_hosts
 
-def run_katana(domain, http_hosts=None, passive=True):
+def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True):
     """
     Crawls/spiders to discover endpoints, JS files, forms, API paths.
-    passive=True uses Wayback+CommonCrawl (100% passive, default).
-    passive=False actively crawls the target (--active mode).
+    passive=True uses Wayback+CommonCrawl (100% passive, default) against all resolved hosts.
+    passive=False actively crawls the target (--active mode) against live HTTP hosts.
     """
     mode_str = "passive (Wayback/CommonCrawl)" if passive else "active crawl"
     print(f"[*] Running katana [{mode_str}] for endpoint discovery...")
@@ -617,19 +534,26 @@ def run_katana(domain, http_hosts=None, passive=True):
         print("[-] 'katana' not found. Skipping.")
         return endpoints
     try:
+        tmp = None
         if passive:
-            cmd = ["katana", "-u", f"https://{domain}", "-ps", "-jsonl", "-silent"]
+            targets = [h["host"] for h in (resolved_hosts or [])] or [domain]
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                              prefix='ghostdorks_katana_passive_', delete=False)
+            tmp.write('\n'.join(targets))
+            tmp.close()
+            cmd = ["katana", "-list", tmp.name, "-ps", "-jsonl", "-silent"]
         else:
             targets = [h["url"] for h in (http_hosts or [])] or [f"https://{domain}"]
             tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
-                                              prefix='ghostdorks_katana_', delete=False)
+                                              prefix='ghostdorks_katana_active_', delete=False)
             tmp.write('\n'.join(targets))
             tmp.close()
             cmd = ["katana", "-list", tmp.name, "-d", "3",
                    "-jc", "-jsonl", "-silent", "-c", "20"]
 
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if not passive:
+        
+        if tmp:
             try:
                 os.unlink(tmp.name)
             except Exception:
@@ -789,7 +713,7 @@ def generate_ghost_dashboard(target, cfg=None):
         co_hosted_domains = fetch_reverse_ip(target_ip)
 
     # 10. Katana passive mode — always runs (Wayback/CommonCrawl)
-    katana_endpoints = run_katana(target, passive=True)
+    katana_endpoints = run_katana(target, resolved_hosts=resolved_hosts, passive=True)
 
     # ── Active pipeline (--active flag required) ──────────
     naabu_results  = []
