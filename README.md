@@ -31,12 +31,12 @@ pip install requests
 Run the script from the command line and specify the target domain using the `-d` or `--domain` argument.
 
 ```bash
-python script.py -d target.com
+python ghostdorks.py -d target.com
 ```
 
 ### Example
 ```bash
-python script.py -d example.com
+python ghostdorks.py -d example.com
 ```
 
 Once the scan is complete, the tool will generate an HTML file named `ghost_dorks_example_com.html` in your current working directory. Simply open this file in any modern web browser to view and interact with your intelligence dashboard.
