@@ -446,7 +446,7 @@ def run_naabu(resolved_hosts, rate=1000):
         tmp.write('\n'.join(hosts))
         tmp.close()
         proc = subprocess.run(
-            ["naabu", "-list", tmp.name, "-top-ports", "1000", "-rate", str(rate), "-json", "-silent", "-exclude-cdn"],
+            ["naabu", "-list", tmp.name, "-top-ports", "1000", "-rate", str(rate), "-json", "-silent"],
             capture_output=True, text=True, timeout=300
         )
         os.unlink(tmp.name)
@@ -483,9 +483,13 @@ def run_httpx(resolved_hosts, naabu_results=None):
         print("[-] 'httpx' not found. Skipping.")
         return http_hosts
     try:
+        targets = []
         if naabu_results:
-            targets = list(set(f"{r['host']}:{r['port']}" for r in naabu_results if r['port'] in [80, 443, 8080, 8443, 8000, 8888, 3000, 5000]))
-        else:
+            # Only send likely HTTP ports to httpx to prevent hanging on SSH/POP3
+            valid_http_ports = {80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 8081, 9000}
+            targets = list(set(f"{r['host']}:{r['port']}" for r in naabu_results if int(r['port']) in valid_http_ports))
+        if not targets:
+            # Fallback to standard ports if naabu found no HTTP ports
             targets = [h["host"] for h in resolved_hosts]
 
         tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_httpx_', delete=False)
@@ -504,11 +508,11 @@ def run_httpx(resolved_hosts, naabu_results=None):
                     continue
                 http_hosts.append({
                     "url": url,
-                    "status": entry.get("status-code", 0),
+                    "status": entry.get("status_code", entry.get("status-code", 0)),
                     "title": entry.get("title", ""),
-                    "server": entry.get("server", ""),
+                    "server": entry.get("webserver", entry.get("server", "")),
                     "tech": entry.get("tech", []),
-                    "content_length": entry.get("content-length", 0),
+                    "content_length": entry.get("content_length", entry.get("content-length", 0)),
                 })
             except json.JSONDecodeError:
                 continue
