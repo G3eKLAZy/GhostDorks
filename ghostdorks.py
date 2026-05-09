@@ -4,6 +4,11 @@ import html
 import argparse
 import requests
 import socket
+import subprocess
+import shutil
+import json
+import re
+import tempfile
 
 # Modern browser headers to bypass basic anti-bot protections/WAFs
 HEADERS = {
@@ -107,6 +112,240 @@ def fetch_subdomains(domain):
             
     return sorted(list(subdomains))
 
+def fetch_whois_info(domain):
+    """
+    Passively fetches WHOIS data for the target domain using the system 'whois' command.
+    Parses registrar, dates, organization, country, and nameservers.
+    """
+    print(f"[*] Running WHOIS lookup for {domain}...")
+    whois_data = {
+        "registrar": "N/A",
+        "creation_date": "N/A",
+        "expiry_date": "N/A",
+        "updated_date": "N/A",
+        "organization": "N/A",
+        "country": "N/A",
+        "name_servers": [],
+        "registrant_email": "N/A",
+        "dnssec": "N/A",
+        "raw": ""
+    }
+    
+    if not shutil.which("whois"):
+        print("[-] 'whois' command not found. Skipping WHOIS module.")
+        return whois_data
+    
+    try:
+        result = subprocess.run(
+            ["whois", domain],
+            capture_output=True, text=True, timeout=30
+        )
+        raw_output = result.stdout
+        whois_data["raw"] = raw_output
+        
+        # Parse key fields (case-insensitive, handles various WHOIS formats)
+        patterns = {
+            "registrar": r"(?:Registrar|registrar)\s*:\s*(.+)",
+            "creation_date": r"(?:Creation Date|Created|created|Registration Date)\s*:\s*(.+)",
+            "expiry_date": r"(?:Expir(?:y|ation) Date|Registry Expiry Date|paid-till)\s*:\s*(.+)",
+            "updated_date": r"(?:Updated Date|Last Updated|last-modified)\s*:\s*(.+)",
+            "organization": r"(?:Registrant Organization|Org(?:anization)?|org-name)\s*:\s*(.+)",
+            "country": r"(?:Registrant Country|Country|country)\s*:\s*(.+)",
+            "registrant_email": r"(?:Registrant Email|e-mail)\s*:\s*(.+)",
+            "dnssec": r"(?:DNSSEC)\s*:\s*(.+)",
+        }
+        
+        for key, pattern in patterns.items():
+            match = re.search(pattern, raw_output, re.IGNORECASE)
+            if match:
+                whois_data[key] = match.group(1).strip()
+        
+        # Parse nameservers (multiple lines)
+        ns_matches = re.findall(r"(?:Name Server|nserver|nameserver)\s*:\s*(.+)", raw_output, re.IGNORECASE)
+        if ns_matches:
+            whois_data["name_servers"] = list(set([ns.strip().lower() for ns in ns_matches]))
+        
+        ns_count = len(whois_data['name_servers'])
+        print(f"[+] WHOIS data retrieved. Registrar: {whois_data['registrar']}, Nameservers: {ns_count}")
+        
+    except subprocess.TimeoutExpired:
+        print("[-] WHOIS lookup timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] User interrupted WHOIS lookup (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] Error running WHOIS: {e}")
+    
+    return whois_data
+
+def fetch_dns_records(domain):
+    """
+    Fetches DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME) using 'dig'.
+    Also analyzes SPF, DKIM, and DMARC policies from TXT records.
+    """
+    print(f"[*] Querying DNS records for {domain}...")
+    dns_data = {
+        "A": [], "AAAA": [], "MX": [], "NS": [], "TXT": [],
+        "SOA": [], "CNAME": [],
+        "spf": None, "dmarc": None, "dkim": None,
+        "security_notes": []
+    }
+    
+    if not shutil.which("dig"):
+        print("[-] 'dig' command not found. Skipping DNS module.")
+        return dns_data
+    
+    record_types = ["A", "AAAA", "MX", "NS", "TXT", "SOA", "CNAME"]
+    
+    for rtype in record_types:
+        try:
+            result = subprocess.run(
+                ["dig", "+short", domain, rtype],
+                capture_output=True, text=True, timeout=15
+            )
+            lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+            dns_data[rtype] = lines
+        except subprocess.TimeoutExpired:
+            print(f"[-] DNS query for {rtype} records timed out.")
+        except Exception as e:
+            print(f"[-] Error querying {rtype} records: {e}")
+    
+    # Analyze SPF, DMARC, DKIM from TXT records
+    for txt_record in dns_data["TXT"]:
+        if "v=spf1" in txt_record.lower():
+            dns_data["spf"] = txt_record
+    
+    # Check DMARC via _dmarc subdomain
+    try:
+        result = subprocess.run(
+            ["dig", "+short", f"_dmarc.{domain}", "TXT"],
+            capture_output=True, text=True, timeout=15
+        )
+        dmarc_out = result.stdout.strip()
+        if dmarc_out:
+            dns_data["dmarc"] = dmarc_out
+    except Exception:
+        pass
+    
+    # Security analysis
+    if not dns_data["spf"]:
+        dns_data["security_notes"].append("⚠️ No SPF record found — domain is vulnerable to email spoofing")
+    elif "+all" in (dns_data["spf"] or ""):
+        dns_data["security_notes"].append("⚠️ SPF uses +all (permissive) — effectively no protection")
+    
+    if not dns_data["dmarc"]:
+        dns_data["security_notes"].append("⚠️ No DMARC record found — phishing risk")
+    elif "p=none" in (dns_data["dmarc"] or "").lower():
+        dns_data["security_notes"].append("⚠️ DMARC policy is 'none' — monitoring only, no enforcement")
+    
+    total = sum(len(v) for k, v in dns_data.items() if k in record_types)
+    print(f"[+] DNS enumeration complete. {total} total records found.")
+    if dns_data["security_notes"]:
+        for note in dns_data["security_notes"]:
+            print(f"    {note}")
+    
+    return dns_data
+
+def fetch_emails_theharvester(domain):
+    """
+    Uses theHarvester to passively collect email addresses, hosts, and IPs
+    from search engines and public data sources.
+    """
+    print(f"[*] Running theHarvester for email/host enumeration on {domain}...")
+    harvest_data = {
+        "emails": [],
+        "hosts": [],
+        "ips": []
+    }
+    
+    if not shutil.which("theHarvester"):
+        print("[-] 'theHarvester' command not found. Skipping email harvesting module.")
+        return harvest_data
+    
+    # Use a temp file for JSON output
+    tmp_dir = tempfile.mkdtemp(prefix="ghostdorks_")
+    output_base = os.path.join(tmp_dir, "harvest")
+    
+    try:
+        result = subprocess.run(
+            ["theHarvester", "-d", domain, "-b", "anubis,crtsh,dnsdumpster,duckduckgo,hackertarget,rapiddns,urlscan",
+             "-l", "200", "-f", output_base],
+            capture_output=True, text=True, timeout=120
+        )
+        
+        # theHarvester saves to <output_base>.json
+        json_path = output_base + ".json"
+        if os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            
+            harvest_data["emails"] = sorted(set(data.get("emails", [])))
+            harvest_data["hosts"] = sorted(set(data.get("hosts", [])))
+            harvest_data["ips"] = sorted(set(data.get("ips", [])))
+            
+            print(f"[+] theHarvester found: {len(harvest_data['emails'])} emails, "
+                  f"{len(harvest_data['hosts'])} hosts, {len(harvest_data['ips'])} IPs")
+        else:
+            # Fallback: parse stdout for emails
+            print("[-] theHarvester JSON output not found, parsing stdout...")
+            email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+            found_emails = email_pattern.findall(result.stdout)
+            harvest_data["emails"] = sorted(set(found_emails))
+            if harvest_data["emails"]:
+                print(f"[+] Parsed {len(harvest_data['emails'])} emails from stdout.")
+            else:
+                print("[-] No emails found.")
+    
+    except subprocess.TimeoutExpired:
+        print("[-] theHarvester timed out after 120 seconds.")
+    except KeyboardInterrupt:
+        print("\n[!] User interrupted theHarvester (Ctrl+C). Skipping...")
+    except Exception as e:
+        print(f"[-] Error running theHarvester: {e}")
+    finally:
+        # Clean up temp files
+        try:
+            import shutil as sh
+            sh.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+    
+    return harvest_data
+
+def fetch_reverse_ip(ip_address):
+    """
+    Performs a reverse IP lookup to find other domains hosted on the same IP.
+    Uses the HackerTarget API (same API already in use for subdomains).
+    """
+    print(f"[*] Running reverse IP lookup for {ip_address}...")
+    co_hosted = []
+    
+    if not ip_address:
+        return co_hosted
+    
+    url = f"https://api.hackertarget.com/reverseiplookup/?q={ip_address}"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=30)
+        if response.status_code == 200:
+            if "error" not in response.text.lower() and "api count" not in response.text.lower():
+                lines = response.text.strip().split('\n')
+                co_hosted = sorted(set([l.strip().lower() for l in lines if l.strip() and l.strip() != "No records found"]))
+                if co_hosted:
+                    print(f"[+] Found {len(co_hosted)} domains co-hosted on {ip_address}.")
+                else:
+                    print(f"[-] No co-hosted domains found.")
+            else:
+                print(f"[-] HackerTarget API limit reached for reverse IP lookup.")
+        else:
+            print(f"[-] Reverse IP lookup returned status code: {response.status_code}")
+    except requests.exceptions.Timeout:
+        print("[-] Reverse IP lookup timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] User interrupted reverse IP lookup (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] Error during reverse IP lookup: {e}")
+    
+    return co_hosted
+
 def fetch_wayback_urls(domain):
     """
     Queries the Wayback Machine CDX API for highly sensitive archived files.
@@ -180,7 +419,7 @@ def fetch_open_ports(ip_address):
 def generate_ghost_dashboard(target):
     safe_target = html.escape(target)
     
-    # 1. Active Data Fetching (Subdomains & Wayback)
+    # 1. Passive Data Fetching (Subdomains & Wayback)
     discovered_subdomains = fetch_subdomains(target)
     discovered_wayback_urls = fetch_wayback_urls(target)
     
@@ -193,6 +432,20 @@ def generate_ghost_dashboard(target):
         open_ports, vulns = fetch_open_ports(target_ip)
     except socket.gaierror:
         print(f"[-] Could not resolve IP address for {target}. Skipping Shodan scan.")
+    
+    # 3. NEW: WHOIS Intelligence
+    whois_info = fetch_whois_info(target)
+    
+    # 4. NEW: DNS Record Map
+    dns_records = fetch_dns_records(target)
+    
+    # 5. NEW: Email Harvesting via theHarvester
+    harvest_data = fetch_emails_theharvester(target)
+    
+    # 6. NEW: Reverse IP Lookup
+    co_hosted_domains = []
+    if target_ip:
+        co_hosted_domains = fetch_reverse_ip(target_ip)
 
     # 3. Base Google Dork Map
     dork_map = {
@@ -282,7 +535,7 @@ def generate_ghost_dashboard(target):
         <meta charset="UTF-8">
         <title>GhostDorks - {safe_target}</title>
         <style>
-            :root {{ --main-green: #00ff41; --bg-black: #0d0d0d; --card-bg: #1a1a1a; --blue: #00ccff; --wayback-yellow: #ffb800; --shodan-red: #ff3333; }}
+            :root {{ --main-green: #00ff41; --bg-black: #0d0d0d; --card-bg: #1a1a1a; --blue: #00ccff; --wayback-yellow: #ffb800; --shodan-red: #ff3333; --whois-cyan: #00e5ff; --dns-purple: #b388ff; --harvest-orange: #ff9100; --reverse-teal: #1de9b6; }}
             body {{ font-family: 'Courier New', monospace; background-color: var(--bg-black); color: var(--main-green); margin: 0; padding: 20px; }}
             .container {{ max-width: 1200px; margin: auto; }}
             header {{ border-bottom: 2px solid var(--main-green); padding-bottom: 20px; margin-bottom: 30px; text-align: center; }}
@@ -297,6 +550,17 @@ def generate_ghost_dashboard(target):
 
             .category-section {{ margin-bottom: 30px; border: 1px solid #333; padding: 15px; border-radius: 5px; background: #0a0a0a; }}
             h2 {{ color: #ff003c; font-size: 20px; margin-top: 0; border-bottom: 1px solid #222; padding-bottom: 10px; }}
+            
+            .intel-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+            .intel-table td {{ padding: 8px 12px; border-bottom: 1px solid #222; vertical-align: top; }}
+            .intel-table td:first-child {{ color: #888; white-space: nowrap; width: 180px; font-weight: bold; }}
+            .intel-table td:last-child {{ color: #ddd; word-break: break-all; }}
+            
+            .dns-badge {{ display: inline-block; padding: 3px 10px; margin: 3px; border-radius: 3px; font-size: 12px; border: 1px solid #333; }}
+            .security-note {{ color: var(--shodan-red); padding: 6px 10px; margin: 4px 0; font-size: 13px; background: rgba(255,51,51,0.1); border-left: 3px solid var(--shodan-red); }}
+            
+            .email-chip {{ display: inline-block; padding: 5px 12px; margin: 3px; border-radius: 20px; font-size: 13px; background: rgba(255,145,0,0.15); border: 1px solid var(--harvest-orange); color: var(--harvest-orange); }}
+            .host-chip {{ display: inline-block; padding: 5px 12px; margin: 3px; border-radius: 20px; font-size: 13px; background: rgba(0,229,255,0.1); border: 1px solid var(--whois-cyan); color: var(--whois-cyan); }}
             
             .dork-list {{ display: grid; grid-template-columns: 1fr; gap: 8px; }}
             .dork-item {{ background: #111; padding: 10px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #222; transition: 0.2s; }}
@@ -320,9 +584,13 @@ def generate_ghost_dashboard(target):
                 <h3>   created by: L4ZYG33K</h3>
                 <p>Target: <strong style="color: #fff;">{safe_target}</strong> {f"({target_ip})" if target_ip else ""}</p>
                 <div class="stats">
-                    Passive Subdomains Discovered: <strong style="color: var(--main-green);">{len(discovered_subdomains)}</strong><br>
-                    Juicy files discovered via Wayback Machine: <strong style="color: var(--wayback-yellow);">{len(discovered_wayback_urls)}</strong><br>
-                    Open Ports (Shodan): <strong style="color: var(--shodan-red);">{len(open_ports)}</strong> | Vulnerabilities: <strong style="color: var(--shodan-red);">{len(vulns)}</strong>
+                    Passive Subdomains Discovered: <strong style="color: var(--main-green);">{len(discovered_subdomains)}</strong> |
+                    Wayback Juicy Files: <strong style="color: var(--wayback-yellow);">{len(discovered_wayback_urls)}</strong> |
+                    Open Ports: <strong style="color: var(--shodan-red);">{len(open_ports)}</strong> |
+                    CVEs: <strong style="color: var(--shodan-red);">{len(vulns)}</strong><br>
+                    Emails Harvested: <strong style="color: var(--harvest-orange);">{len(harvest_data['emails'])}</strong> |
+                    DNS Records: <strong style="color: var(--dns-purple);">{sum(len(v) for k, v in dns_records.items() if k in ['A','AAAA','MX','NS','TXT','SOA','CNAME'])}</strong> |
+                    Co-Hosted Domains: <strong style="color: var(--reverse-teal);">{len(co_hosted_domains)}</strong>
                 </div>
             </header>
 
@@ -333,6 +601,101 @@ def generate_ghost_dashboard(target):
 
             <div id="dorkContainer">
     """
+
+    # --- INJECT NEW MODULE SECTIONS ---
+
+    # NEW: WHOIS Intelligence Section
+    if whois_info and whois_info.get("registrar") != "N/A":
+        ns_list = ", ".join(whois_info.get("name_servers", [])) or "N/A"
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--whois-cyan);">🔍 WHOIS Intelligence</h2>
+            <table class="intel-table">
+                <tr><td>Registrar</td><td>{html.escape(whois_info.get('registrar', 'N/A'))}</td></tr>
+                <tr><td>Organization</td><td>{html.escape(whois_info.get('organization', 'N/A'))}</td></tr>
+                <tr><td>Country</td><td>{html.escape(whois_info.get('country', 'N/A'))}</td></tr>
+                <tr><td>Creation Date</td><td>{html.escape(whois_info.get('creation_date', 'N/A'))}</td></tr>
+                <tr><td>Expiry Date</td><td>{html.escape(whois_info.get('expiry_date', 'N/A'))}</td></tr>
+                <tr><td>Updated Date</td><td>{html.escape(whois_info.get('updated_date', 'N/A'))}</td></tr>
+                <tr><td>Registrant Email</td><td>{html.escape(whois_info.get('registrant_email', 'N/A'))}</td></tr>
+                <tr><td>DNSSEC</td><td>{html.escape(whois_info.get('dnssec', 'N/A'))}</td></tr>
+                <tr><td>Name Servers</td><td>{html.escape(ns_list)}</td></tr>
+            </table>
+        </div>"""
+
+    # NEW: DNS Record Map Section
+    dns_record_types = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'SOA', 'CNAME']
+    has_dns = any(dns_records.get(rt) for rt in dns_record_types)
+    if has_dns:
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--dns-purple);">🧬 DNS Record Map</h2>"""
+        
+        # Security notes first
+        if dns_records.get("security_notes"):
+            for note in dns_records["security_notes"]:
+                html_content += f'<div class="security-note">{html.escape(note)}</div>'
+        
+        html_content += '<table class="intel-table">'
+        for rt in dns_record_types:
+            records = dns_records.get(rt, [])
+            if records:
+                records_html = "<br>".join([html.escape(r) for r in records])
+                html_content += f'<tr><td style="color: var(--dns-purple);">{rt}</td><td>{records_html}</td></tr>'
+        
+        # SPF / DMARC summary
+        if dns_records.get("spf"):
+            html_content += f'<tr><td style="color: var(--main-green);">SPF</td><td>{html.escape(dns_records["spf"])}</td></tr>'
+        if dns_records.get("dmarc"):
+            html_content += f'<tr><td style="color: var(--main-green);">DMARC</td><td>{html.escape(dns_records["dmarc"])}</td></tr>'
+        
+        html_content += '</table></div>'
+
+    # NEW: Email Harvesting Section
+    if harvest_data.get("emails") or harvest_data.get("hosts"):
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--harvest-orange);">📧 Harvested Emails & Hosts (theHarvester)</h2>
+            <div style="margin-bottom: 15px;">"""
+        
+        if harvest_data.get("emails"):
+            html_content += '<div style="margin-bottom: 10px;"><strong style="color: #888;">Emails:</strong><br>'
+            for email in harvest_data["emails"]:
+                safe_email = html.escape(email)
+                html_content += f'<span class="email-chip">{safe_email}</span>'
+            html_content += '</div>'
+        
+        if harvest_data.get("hosts"):
+            html_content += '<div style="margin-bottom: 10px;"><strong style="color: #888;">Discovered Hosts:</strong><br>'
+            for h in harvest_data["hosts"][:100]:  # Cap at 100
+                safe_h = html.escape(h)
+                html_content += f'<span class="host-chip">{safe_h}</span>'
+            html_content += '</div>'
+        
+        if harvest_data.get("ips"):
+            html_content += '<div><strong style="color: #888;">Associated IPs:</strong><br>'
+            for ip in harvest_data["ips"][:50]:  # Cap at 50
+                safe_ip = html.escape(ip)
+                html_content += f'<span class="dns-badge" style="border-color: var(--harvest-orange); color: var(--harvest-orange);">{safe_ip}</span>'
+            html_content += '</div>'
+        
+        html_content += '</div></div>'
+
+    # NEW: Reverse IP / Co-Hosted Domains Section
+    if co_hosted_domains:
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--reverse-teal);">🗺️ Co-Hosted Domains (Reverse IP: {target_ip})</h2>
+            <div class="dork-list">"""
+        for co_domain in co_hosted_domains[:200]:  # Cap at 200
+            safe_co = html.escape(co_domain)
+            google_url = f"https://www.google.com/search?q=site:{urllib.parse.quote_plus(co_domain)}"
+            html_content += f"""
+                <div class="dork-item">
+                    <a href="{google_url}" target="_blank" class="dork-text" style="color: var(--reverse-teal);">{safe_co}</a>
+                    <button class="copy-btn" data-dork="{safe_co}" onclick="copyToClipboard(this.getAttribute('data-dork'))">COPY</button>
+                </div>"""
+        html_content += '</div></div>'
 
     # 6. Inject Shodan Intel Section (FIXED WITH CSS OVERRIDE FOR WRAPPING)
     if open_ports or vulns:
