@@ -1,108 +1,193 @@
 # 🕵️ PROJECT GHOST ENGINE (GhostDorks)
 
+> Advanced passive OSINT dashboard generator with an optional full active scanning pipeline — all in one Python script.
+
+---
+
 ## 📖 Description
 
-Project Ghost Engine is an advanced, automated OSINT (Open Source Intelligence) and reconnaissance tool designed for security researchers, bug bounty hunters, and penetration testers. It aggregates data from various passive sources and generates a highly interactive, standalone HTML dashboard tailored to a specific target domain.
+Project Ghost Engine is an automated OSINT and reconnaissance tool designed for security researchers, bug bounty hunters, and penetration testers. It aggregates data from multiple passive sources **and** can optionally chain into a full active scanning pipeline using ProjectDiscovery tools installed on Kali Linux.
 
-The tool combines passive DNS enumeration, WHOIS intelligence, DNS record mapping, email harvesting, reverse IP analysis, archived file discovery, IP port scanning, and an extensive list of categorized Google Dorks to provide a comprehensive attack surface map — all without sending aggressive or noisy requests directly to the target infrastructure.
+All results are compiled into a **self-contained, color-coded, searchable HTML dashboard** plus a structured **JSON summary** — both saved automatically after every run.
 
-## ✨ Features
+---
 
-### 🌐 Passive Subdomain Enumeration
-Implements a highly resilient triple-redundant fallback system querying **crt.sh**, **AlienVault OTX**, and **HackerTarget**.
+## ✨ Feature Modules
 
-### 🔍 WHOIS Intelligence
-Extracts domain registration details including registrar, creation/expiry dates, organization, country, nameservers, and DNSSEC status using the system `whois` command.
+### 🟢 Passive Mode (Always Active — No Target Contact)
 
-### 🧬 DNS Record Map
-Enumerates all DNS record types (A, AAAA, MX, NS, TXT, SOA, CNAME) using `dig`. Automatically analyzes **SPF** and **DMARC** policies and flags missing or misconfigured email security as vulnerabilities.
+| Module | Tool / Source | What It Collects |
+|--------|--------------|-----------------|
+| Subdomain Enumeration | crt.sh → AlienVault OTX → HackerTarget | Passive subdomains via certificate transparency & DNS |
+| Subfinder | `subfinder` (40+ OSINT APIs) | Extended subdomain list merged with above |
+| DNS Validation | `dnsx` | Resolves live subdomains, detects CNAME takeover candidates |
+| Katana (passive) | `katana -ps` (Wayback + CommonCrawl) | Endpoints, JS files, API paths from archives |
+| Wayback Machine | web.archive.org CDX API | Archived sensitive files (.env, .sql, .bak, .pem…) |
+| Shodan InternetDB | internetdb.shodan.io | Open ports + known CVEs for the target IP |
+| WHOIS Intelligence | `whois` | Registrar, org, dates, nameservers, DNSSEC |
+| DNS Record Map | `dig` | A/AAAA/MX/NS/TXT/SOA/CNAME + SPF/DMARC analysis |
+| Email Harvesting | `theHarvester` | Emails, hostnames, IPs from 7 OSINT sources |
+| Reverse IP Lookup | HackerTarget API | Co-hosted domains on the same IP |
+| Google Dorks | Generated locally | 130+ categorized, clickable dork queries |
 
-### 📧 Email & Host Harvesting
-Leverages **theHarvester** to passively collect email addresses, hostnames, and IP addresses from 7 OSINT sources (Anubis, crt.sh, DNSDumpster, DuckDuckGo, HackerTarget, RapidDNS, URLScan).
+### 🟡 Active Mode (`--active` flag — Light traffic, looks like a browser)
 
-### 🗺️ Reverse IP Lookup
-Discovers all domains co-hosted on the same IP address, revealing shared hosting environments and expanding the attack surface.
+| Module | Tool | What It Collects |
+|--------|------|-----------------|
+| Port Scanning | `naabu` | Top-1000 ports across all resolved subdomains |
+| HTTP Probing | `httpx` | Live HTTP services, status codes, titles, server headers, tech stack |
+| Web Crawling | `katana` (active) | Deep endpoint discovery, JS parsing, form extraction |
 
-### 🕰️ Archived Data Discovery
-Interrogates the **Wayback Machine** to uncover exposed sensitive files (e.g., `.env`, `.sql`, `.bak`, `.json`, `.pem`).
+### 🔴 Nuclear Mode (`--nuclei` flag — Active exploitation probes)
 
-### 🛑 Vulnerability & Port Scanning
-Utilizes the free **Shodan InternetDB** API to map open ports and known CVEs associated with the target's resolved IP address.
+| Module | Tool | What It Collects |
+|--------|------|-----------------|
+| Vulnerability Scanning | `nuclei` | Exposures, misconfigurations, subdomain takeovers — severity-ranked |
 
-### 🔗 Dynamic Google Dorks Map
-Automatically generates a robust, clickable list of **130+ Google Dorks** customized for the target domain. Categories include:
-- Subdomain Enum & Takeover
-- Directory & File Exposure
-- Secrets, Configs & Leaks
-- Admin Panels
-- APIs & Swagger Docs
-- Cloud Storage (S3, GCP, Azure)
-- Error & Debug Pages
-- Documents & Social Media
-- ...and more!
+---
 
-### 📊 Interactive HTML Dashboard
-Exports all findings into a sleek, color-coded, and searchable HTML dashboard. Features include:
-- **Live search filter** across all sections
-- **One-click copy** to clipboard
-- **Export-to-PDF** button
-- **Color-coded modules** (Cyan, Purple, Orange, Teal, Yellow, Red)
-- **Security alerts** for missing SPF/DMARC
+## 🔗 Pipeline Architecture
 
-## 📋 Module Overview
+```
+                    ┌─ crt.sh / OTX / HackerTarget ─┐
+TARGET DOMAIN ──►   ├─ subfinder (40+ sources)       ├──► MERGED SUBDOMAIN LIST
+                    └────────────────────────────────┘
+                              │
+                              ▼
+                        dnsx (validate, resolve A/CNAME, detect takeovers)
+                              │
+                    ┌─────────┴──────────┐
+                    │ [passive]          │ [--active]
+                    ▼                   ▼
+              katana -ps           naabu (port scan)
+              Wayback CDX               │
+                                   httpx (HTTP probe)
+                                        │
+                                   katana (active crawl)
+                                        │
+                                   [--nuclei]
+                                        ▼
+                              nuclei (vuln scan 💀)
+                                        │
+                                        ▼
+                          ┌─────────────────────────┐
+                          │   HTML Dashboard         │
+                          │   JSON Summary           │
+                          └─────────────────────────┘
+```
 
-| Module | Source / Tool | Data Collected |
-|--------|--------------|----------------|
-| Subdomain Enum | crt.sh → AlienVault OTX → HackerTarget | Passive subdomains via certificate transparency & DNS |
-| WHOIS Intel | `whois` | Registrar, org, dates, nameservers, DNSSEC |
-| DNS Record Map | `dig` | A, AAAA, MX, NS, TXT, SOA, CNAME + SPF/DMARC analysis |
-| Email Harvesting | `theHarvester` | Emails, hostnames, IPs from 7 passive sources |
-| Reverse IP | HackerTarget API | Co-hosted domains on the same IP |
-| Wayback Machine | web.archive.org CDX API | Archived sensitive files |
-| Shodan Intel | internetdb.shodan.io | Open ports + known CVEs |
-| Google Dorks | Generated locally | 130+ categorized dork queries |
+---
+
+## 📊 Dashboard Sections
+
+The generated HTML dashboard includes (in order):
+
+1. 🔍 WHOIS Intelligence
+2. 🧬 DNS Record Map (SPF/DMARC alerts)
+3. 📧 Harvested Emails & Hosts
+4. 🗺️ Co-Hosted Domains (Reverse IP)
+5. 🧬 Live Resolved Hosts (dnsx) + Takeover Candidates
+6. 🌐 Live HTTP Services (httpx)
+7. 🕸️ Crawled Endpoints (katana) — Sensitive / API / Other
+8. 💀 Nuclei Findings (severity-badged)
+9. 🛑 Shodan Intel (ports + CVEs)
+10. 🕰️ Archived Sensitive Files (Wayback)
+11. 🌐 Discovered Subdomains
+12. 📂 130+ Google Dork Categories
+
+---
 
 ## ⚙️ Prerequisites
 
 ### Python
-This project requires **Python 3.x** and the `requests` library:
+Requires **Python 3.x** and the `requests` library:
 
 ```bash
 pip install requests
 ```
 
-### Kali Linux Tools (Recommended)
-For full functionality, the following tools should be installed. These come **pre-installed on Kali Linux**:
+### Kali Linux Tools
+The following tools are **pre-installed on Kali Linux**. Ghost Engine will automatically skip any module whose tool is not found — no errors, no crashes.
 
-| Tool | Purpose | Install Command |
-|------|---------|-----------------|
-| `whois` | WHOIS domain lookups | `sudo apt install whois` |
+| Tool | Purpose | Install (if missing) |
+|------|---------|----------------------|
+| `subfinder` | Extended passive subdomain enumeration | `sudo apt install subfinder` |
+| `dnsx` | DNS validation & takeover detection | `sudo apt install dnsx` |
+| `naabu` | Fast port scanning (`--active`) | `sudo apt install naabu` |
+| `httpx` | HTTP probing & tech fingerprinting (`--active`) | `sudo apt install httpx` |
+| `katana` | Web crawling / endpoint discovery | `sudo apt install katana` |
+| `nuclei` | Vulnerability scanning (`--nuclei`) | `sudo apt install nuclei` |
+| `whois` | WHOIS lookups | `sudo apt install whois` |
 | `dig` | DNS record enumeration | `sudo apt install dnsutils` |
 | `theHarvester` | Email & host harvesting | `sudo apt install theharvester` |
 
-> **Note:** If any tool is not found, GhostDorks will gracefully skip that module and continue with the remaining scans.
+---
 
 ## 🚀 Usage
 
-Run the script from the command line and specify the target domain using the `-d` or `--domain` argument:
-
+### Passive Only (Default — Safe, no target contact)
 ```bash
 python ghostdorks.py -d target.com
 ```
 
-### Example
-
+### With Active Scanning (naabu + httpx + katana)
 ```bash
-python ghostdorks.py -d example.com
+python ghostdorks.py -d target.com --active
 ```
 
-Once the scan is complete, the tool will generate an HTML file named `ghost_dorks_example_com.html` in your current working directory. Simply open this file in any modern web browser to view and interact with your intelligence dashboard.
-
-### Sample Output
-
+### Full Nuclear Mode (active + nuclei vuln scan)
+```bash
+python ghostdorks.py -d target.com --active --nuclei
 ```
+
+### Throttled / Stealth Rate
+```bash
+python ghostdorks.py -d target.com --active --nuclei --rate 300
+```
+
+### All Options
+```
+options:
+  -d, --domain DOMAIN   Target domain (e.g., example.com)
+  --active              Enable active scanning: naabu + httpx + katana
+                        Sends packets directly to target.
+  --nuclei              Enable nuclei vulnerability scanning
+                        (exposures + misconfigs + takeovers).
+                        ONLY use with permission.
+  --rate N              Rate limit for active tools (default: 1000).
+                        Lower for stealth (e.g. 300).
+```
+
+---
+
+## 📁 Output Files
+
+After each run, two files are saved in your current directory:
+
+| File | Description |
+|------|-------------|
+| `ghost_dorks_<target>.html` | Full interactive dashboard — open in any browser |
+| `ghost_dorks_<target>.json` | Structured JSON with all raw findings — pipe into other tools |
+
+### Sample Terminal Output
+```
+=======================================================
+  🕵️  PROJECT GHOST ENGINE — Passive Pipeline
+=======================================================
+
 [*] Querying crt.sh for subdomains of example.com...
 [+] Successfully extracted 42 unique subdomains from crt.sh.
+[*] Running subfinder for passive subdomain enumeration on example.com...
+[+] subfinder found 67 subdomains.
+[+] Combined subdomain list: 89 unique entries.
+[*] Running dnsx to validate 89 subdomains...
+[+] dnsx resolved 54 live hosts, 2 potential takeover candidates.
+[*] Running katana [passive (Wayback/CommonCrawl)] for endpoint discovery...
+[+] katana discovered 138 endpoint(s).
+[*] Querying Wayback Machine for exposed files on example.com...
+[+] Successfully extracted 23 archived URLs from Wayback Machine.
+[*] Querying Shodan InternetDB for ports on 93.184.216.34...
+[+] Found 4 open ports and 2 vulnerabilities.
 [*] Running WHOIS lookup for example.com...
 [+] WHOIS data retrieved. Registrar: MarkMonitor Inc., Nameservers: 2
 [*] Querying DNS records for example.com...
@@ -112,17 +197,18 @@ Once the scan is complete, the tool will generate an HTML file named `ghost_dork
 [+] theHarvester found: 5 emails, 18 hosts, 3 IPs
 [*] Running reverse IP lookup for 93.184.216.34...
 [+] Found 7 domains co-hosted on 93.184.216.34.
-[*] Querying Wayback Machine for exposed files on example.com...
-[+] Successfully extracted 23 archived URLs from Wayback Machine.
-[*] Querying Shodan InternetDB for ports on 93.184.216.34...
-[+] Found 4 open ports and 2 vulnerabilities.
 
-[+] Ghost Dashboard Generated: ghost_dorks_example_com.html
+[+] Ghost Dashboard Generated : ghost_dorks_example_com.html
+[+] JSON Summary Saved        : ghost_dorks_example_com.json
 ```
+
+---
 
 ## ⚠️ Disclaimer
 
-This tool is intended for **educational purposes and authorized security auditing only**. The developers and contributors assume no liability and are not responsible for any misuse or damage caused by this program. Always ensure you have explicit, written permission from the owner before testing a target.
+This tool is intended for **educational purposes and authorized security auditing only**. The developers and contributors assume no liability and are not responsible for any misuse or damage caused by this program. Always ensure you have **explicit, written permission** from the target owner before running any active modules (`--active`, `--nuclei`).
+
+---
 
 ## 👨‍💻 Credits
 
