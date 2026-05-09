@@ -416,14 +416,355 @@ def fetch_open_ports(ip_address):
         
     return ports, cves
 
-def generate_ghost_dashboard(target):
+# ─────────────────────────────────────────────
+# ProjectDiscovery Pipeline Modules
+# ─────────────────────────────────────────────
+
+def run_subfinder(domain):
+    """
+    Runs subfinder to passively enumerate subdomains from 40+ OSINT sources.
+    Merges results with the existing subdomain list.
+    Passivity: 100% passive — queries third-party APIs only.
+    """
+    print(f"[*] Running subfinder for passive subdomain enumeration on {domain}...")
+    results = []
+    if not shutil.which("subfinder"):
+        print("[-] 'subfinder' not found. Skipping.")
+        return results
+    try:
+        proc = subprocess.run(
+            ["subfinder", "-d", domain, "-silent", "-all"],
+            capture_output=True, text=True, timeout=120
+        )
+        for line in proc.stdout.strip().splitlines():
+            sub = line.strip().lower()
+            if sub and sub.endswith(domain):
+                results.append(sub)
+        results = sorted(set(results))
+        print(f"[+] subfinder found {len(results)} subdomains.")
+    except subprocess.TimeoutExpired:
+        print("[-] subfinder timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted subfinder (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] subfinder error: {e}")
+    return results
+
+def run_dnsx(subdomains):
+    """
+    Validates and resolves a list of subdomains using dnsx.
+    Filters dead entries and detects CNAME takeover candidates.
+    Passivity: 100% passive — standard public DNS queries only.
+    """
+    print(f"[*] Running dnsx to validate {len(subdomains)} subdomains...")
+    resolved = []
+    takeover_candidates = []
+    if not subdomains:
+        return resolved, takeover_candidates
+    if not shutil.which("dnsx"):
+        print("[-] 'dnsx' not found. Skipping DNS validation.")
+        return resolved, takeover_candidates
+    try:
+        # Write subdomains to a temp file
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                          prefix='ghostdorks_', delete=False)
+        tmp.write('\n'.join(subdomains))
+        tmp.close()
+        proc = subprocess.run(
+            ["dnsx", "-l", tmp.name, "-a", "-cname", "-resp", "-json", "-silent"],
+            capture_output=True, text=True, timeout=180
+        )
+        os.unlink(tmp.name)
+        for line in proc.stdout.strip().splitlines():
+            try:
+                entry = json.loads(line)
+                host = entry.get("host", "")
+                if not host:
+                    continue
+                a_records = entry.get("a", [])
+                cname = entry.get("cname", [])
+                if a_records:
+                    resolved.append({"host": host, "ips": a_records, "cname": cname})
+                elif cname:
+                    # CNAME with no A record = potential takeover
+                    takeover_candidates.append({"host": host, "cname": cname})
+            except json.JSONDecodeError:
+                continue
+        print(f"[+] dnsx resolved {len(resolved)} live hosts, "
+              f"{len(takeover_candidates)} potential takeover candidates.")
+    except subprocess.TimeoutExpired:
+        print("[-] dnsx timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted dnsx (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] dnsx error: {e}")
+    return resolved, takeover_candidates
+
+def run_naabu(resolved_hosts, rate=1000):
+    """
+    Runs naabu to fast-scan top 1000 ports on resolved hosts.
+    ACTIVE — sends TCP SYN packets directly to target IPs.
+    Only called when --active flag is set.
+    """
+    print(f"[*] Running naabu port scan on {len(resolved_hosts)} hosts (rate={rate})...")
+    port_results = []
+    if not resolved_hosts:
+        return port_results
+    if not shutil.which("naabu"):
+        print("[-] 'naabu' not found. Skipping.")
+        return port_results
+    try:
+        hosts = [h["host"] for h in resolved_hosts]
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                          prefix='ghostdorks_naabu_', delete=False)
+        tmp.write('\n'.join(hosts))
+        tmp.close()
+        proc = subprocess.run(
+            ["naabu", "-list", tmp.name, "-top-ports", "1000",
+             "-rate", str(rate), "-json", "-silent", "-exclude-cdn"],
+            capture_output=True, text=True, timeout=300
+        )
+        os.unlink(tmp.name)
+        for line in proc.stdout.strip().splitlines():
+            try:
+                entry = json.loads(line)
+                host = entry.get("host", "")
+                port = entry.get("port", 0)
+                ip   = entry.get("ip", "")
+                if host and port:
+                    port_results.append({"host": host, "port": port, "ip": ip})
+            except json.JSONDecodeError:
+                continue
+        print(f"[+] naabu found {len(port_results)} open port(s) across all hosts.")
+    except subprocess.TimeoutExpired:
+        print("[-] naabu timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted naabu (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] naabu error: {e}")
+    return port_results
+
+def run_httpx(resolved_hosts, naabu_results=None):
+    """
+    Probes hosts for live HTTP/HTTPS services, grabbing title, status,
+    server header, tech stack, and TLS info.
+    ACTIVE — sends HTTP requests (looks like normal browser traffic).
+    Only called when --active flag is set.
+    """
+    print(f"[*] Running httpx to probe live HTTP services...")
+    http_hosts = []
+    if not resolved_hosts:
+        return http_hosts
+    if not shutil.which("httpx"):
+        print("[-] 'httpx' not found. Skipping.")
+        return http_hosts
+    try:
+        # Build input: prefer naabu host:port combos if available
+        if naabu_results:
+            targets = list(set(
+                f"{r['host']}:{r['port']}" for r in naabu_results
+                if r['port'] in [80, 443, 8080, 8443, 8000, 8888, 3000, 5000]
+            ))
+        else:
+            targets = [h["host"] for h in resolved_hosts]
+
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                          prefix='ghostdorks_httpx_', delete=False)
+        tmp.write('\n'.join(targets))
+        tmp.close()
+        proc = subprocess.run(
+            ["httpx", "-l", tmp.name,
+             "-status-code", "-title", "-server", "-tech-detect",
+             "-follow-redirects", "-json", "-silent", "-threads", "50"],
+            capture_output=True, text=True, timeout=300
+        )
+        os.unlink(tmp.name)
+        for line in proc.stdout.strip().splitlines():
+            try:
+                entry = json.loads(line)
+                url = entry.get("url", "")
+                if not url:
+                    continue
+                http_hosts.append({
+                    "url": url,
+                    "status": entry.get("status-code", 0),
+                    "title": entry.get("title", ""),
+                    "server": entry.get("server", ""),
+                    "tech": entry.get("tech", []),
+                    "content_length": entry.get("content-length", 0),
+                })
+            except json.JSONDecodeError:
+                continue
+        print(f"[+] httpx found {len(http_hosts)} live HTTP endpoint(s).")
+    except subprocess.TimeoutExpired:
+        print("[-] httpx timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted httpx (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] httpx error: {e}")
+    return http_hosts
+
+def run_katana(domain, http_hosts=None, passive=True):
+    """
+    Crawls/spiders to discover endpoints, JS files, forms, API paths.
+    passive=True uses Wayback+CommonCrawl (100% passive, default).
+    passive=False actively crawls the target (--active mode).
+    """
+    mode_str = "passive (Wayback/CommonCrawl)" if passive else "active crawl"
+    print(f"[*] Running katana [{mode_str}] for endpoint discovery...")
+    endpoints = []
+    if not shutil.which("katana"):
+        print("[-] 'katana' not found. Skipping.")
+        return endpoints
+    try:
+        if passive:
+            cmd = ["katana", "-u", f"https://{domain}", "-ps", "-jsonl", "-silent"]
+        else:
+            targets = [h["url"] for h in (http_hosts or [])] or [f"https://{domain}"]
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                              prefix='ghostdorks_katana_', delete=False)
+            tmp.write('\n'.join(targets))
+            tmp.close()
+            cmd = ["katana", "-list", tmp.name, "-d", "3",
+                   "-jc", "-jsonl", "-silent", "-c", "20"]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if not passive:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+        sensitive_ext = {'.env', '.sql', '.bak', '.json', '.xml', '.yaml',
+                         '.yml', '.log', '.conf', '.config', '.key', '.pem'}
+        api_patterns = re.compile(r'/(api|v\d|graphql|rest|swagger|openapi)', re.I)
+
+        for line in proc.stdout.strip().splitlines():
+            try:
+                entry = json.loads(line)
+                url = entry.get("request", {}).get("endpoint", "") or entry.get("endpoint", "")
+                if not url:
+                    continue
+                ext = os.path.splitext(url.split('?')[0])[1].lower()
+                is_sensitive = ext in sensitive_ext
+                is_api = bool(api_patterns.search(url))
+                endpoints.append({
+                    "url": url,
+                    "sensitive": is_sensitive,
+                    "api": is_api,
+                })
+            except (json.JSONDecodeError, AttributeError):
+                continue
+        print(f"[+] katana discovered {len(endpoints)} endpoint(s).")
+    except subprocess.TimeoutExpired:
+        print("[-] katana timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted katana (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] katana error: {e}")
+    return endpoints
+
+def run_nuclei(http_hosts, katana_endpoints=None, rate=150):
+    """
+    Runs nuclei vulnerability scanner against discovered HTTP hosts.
+    Uses exposures/, misconfiguration/, takeovers/ templates by default.
+    ACTIVE — sends crafted probes. Only call with --nuclei flag.
+    """
+    print(f"[*] Running nuclei vulnerability scan (rate={rate})...")
+    findings = []
+    if not http_hosts and not katana_endpoints:
+        print("[-] No HTTP targets for nuclei. Skipping.")
+        return findings
+    if not shutil.which("nuclei"):
+        print("[-] 'nuclei' not found. Skipping.")
+        return findings
+
+    # Build target list: prefer katana endpoints (more surface area)
+    if katana_endpoints:
+        targets = list(set(e["url"] for e in katana_endpoints))[:500]
+    else:
+        targets = [h["url"] for h in http_hosts]
+
+    try:
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                          prefix='ghostdorks_nuclei_', delete=False)
+        tmp.write('\n'.join(targets))
+        tmp.close()
+        proc = subprocess.run(
+            ["nuclei", "-l", tmp.name,
+             "-t", "exposures/", "-t", "misconfiguration/", "-t", "takeovers/",
+             "-severity", "critical,high,medium,low",
+             "-rate-limit", str(rate),
+             "-json", "-silent", "-no-color"],
+            capture_output=True, text=True, timeout=600
+        )
+        os.unlink(tmp.name)
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        for line in proc.stdout.strip().splitlines():
+            try:
+                entry = json.loads(line)
+                sev = entry.get("info", {}).get("severity", "info").lower()
+                findings.append({
+                    "template": entry.get("template-id", "unknown"),
+                    "name": entry.get("info", {}).get("name", ""),
+                    "severity": sev,
+                    "severity_order": severity_order.get(sev, 5),
+                    "url": entry.get("matched-at", entry.get("host", "")),
+                    "description": entry.get("info", {}).get("description", ""),
+                    "reference": entry.get("info", {}).get("reference", []),
+                    "curl": entry.get("curl-command", ""),
+                })
+            except json.JSONDecodeError:
+                continue
+        findings.sort(key=lambda x: x["severity_order"])
+        crit = sum(1 for f in findings if f["severity"] == "critical")
+        high = sum(1 for f in findings if f["severity"] == "high")
+        print(f"[+] nuclei found {len(findings)} findings "
+              f"({crit} critical, {high} high).")
+    except subprocess.TimeoutExpired:
+        print("[-] nuclei timed out after 600s.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted nuclei (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] nuclei error: {e}")
+    return findings
+
+def generate_ghost_dashboard(target, cfg=None):
+    if cfg is None:
+        cfg = {}
+    active   = cfg.get("active", False)
+    do_nuclei = cfg.get("nuclei", False)
+    rate     = cfg.get("rate", 1000)
     safe_target = html.escape(target)
-    
-    # 1. Passive Data Fetching (Subdomains & Wayback)
+
+    print("\n" + "="*55)
+    print("  🕵️  PROJECT GHOST ENGINE — Passive Pipeline")
+    print("="*55)
+    if active:
+        print("  ⚠️  ACTIVE MODE enabled (naabu + httpx + katana)")
+    if do_nuclei:
+        print("  💀  NUCLEI enabled — vulnerability scanning active")
+    print("="*55 + "\n")
+
+    # ── Passive baseline (always runs) ────────────────────
+    # 1. Subdomain enumeration
     discovered_subdomains = fetch_subdomains(target)
+
+    # 2. Subfinder (passive, merges with above)
+    sf_subs = run_subfinder(target)
+    all_subdomains = sorted(set(discovered_subdomains) | set(sf_subs))
+    if sf_subs:
+        print(f"[+] Combined subdomain list: {len(all_subdomains)} unique entries.")
+    else:
+        all_subdomains = discovered_subdomains
+
+    # 3. Dnsx — resolve & validate the merged list (always passive)
+    resolved_hosts, takeover_candidates = run_dnsx(all_subdomains)
+
+    # 4. Wayback Machine
     discovered_wayback_urls = fetch_wayback_urls(target)
-    
-    # 2. Shodan Open Ports Scan
+
+    # 5. Shodan InternetDB (passive)
     target_ip = ""
     open_ports = []
     vulns = []
@@ -432,20 +773,44 @@ def generate_ghost_dashboard(target):
         open_ports, vulns = fetch_open_ports(target_ip)
     except socket.gaierror:
         print(f"[-] Could not resolve IP address for {target}. Skipping Shodan scan.")
-    
-    # 3. NEW: WHOIS Intelligence
+
+    # 6. WHOIS Intel (passive)
     whois_info = fetch_whois_info(target)
-    
-    # 4. NEW: DNS Record Map
+
+    # 7. DNS Record Map (passive)
     dns_records = fetch_dns_records(target)
-    
-    # 5. NEW: Email Harvesting via theHarvester
+
+    # 8. Email Harvesting (theHarvester, passive)
     harvest_data = fetch_emails_theharvester(target)
-    
-    # 6. NEW: Reverse IP Lookup
+
+    # 9. Reverse IP Lookup (passive)
     co_hosted_domains = []
     if target_ip:
         co_hosted_domains = fetch_reverse_ip(target_ip)
+
+    # 10. Katana passive mode — always runs (Wayback/CommonCrawl)
+    katana_endpoints = run_katana(target, passive=True)
+
+    # ── Active pipeline (--active flag required) ──────────
+    naabu_results  = []
+    http_hosts     = []
+    nuclei_findings = []
+
+    if active and resolved_hosts:
+        # 11. Naabu port scan
+        naabu_results = run_naabu(resolved_hosts, rate=rate)
+        # 12. HTTPx probe
+        http_hosts = run_httpx(resolved_hosts, naabu_results=naabu_results)
+        # 13. Katana active crawl (overwrites passive endpoints)
+        if http_hosts:
+            katana_endpoints = run_katana(target, http_hosts=http_hosts, passive=False)
+
+    # 14. Nuclei (--nuclei flag required — always needs httpx first)
+    if do_nuclei:
+        if not http_hosts and resolved_hosts:
+            print("[*] --nuclei requires httpx; running httpx first...")
+            http_hosts = run_httpx(resolved_hosts)
+        nuclei_findings = run_nuclei(http_hosts, katana_endpoints=katana_endpoints, rate=150)
 
     # 3. Base Google Dork Map
     dork_map = {
@@ -535,7 +900,7 @@ def generate_ghost_dashboard(target):
         <meta charset="UTF-8">
         <title>GhostDorks - {safe_target}</title>
         <style>
-            :root {{ --main-green: #00ff41; --bg-black: #0d0d0d; --card-bg: #1a1a1a; --blue: #00ccff; --wayback-yellow: #ffb800; --shodan-red: #ff3333; --whois-cyan: #00e5ff; --dns-purple: #b388ff; --harvest-orange: #ff9100; --reverse-teal: #1de9b6; }}
+            :root {{ --main-green: #00ff41; --bg-black: #0d0d0d; --card-bg: #1a1a1a; --blue: #00ccff; --wayback-yellow: #ffb800; --shodan-red: #ff3333; --whois-cyan: #00e5ff; --dns-purple: #b388ff; --harvest-orange: #ff9100; --reverse-teal: #1de9b6; --dnsx-lime: #c6ff00; --httpx-pink: #ff4081; --katana-sky: #40c4ff; --nuclei-crit: #ff1744; --nuclei-high: #ff6d00; --nuclei-med: #ffd600; --nuclei-low: #69f0ae; }}
             body {{ font-family: 'Courier New', monospace; background-color: var(--bg-black); color: var(--main-green); margin: 0; padding: 20px; }}
             .container {{ max-width: 1200px; margin: auto; }}
             header {{ border-bottom: 2px solid var(--main-green); padding-bottom: 20px; margin-bottom: 30px; text-align: center; }}
@@ -561,6 +926,20 @@ def generate_ghost_dashboard(target):
             
             .email-chip {{ display: inline-block; padding: 5px 12px; margin: 3px; border-radius: 20px; font-size: 13px; background: rgba(255,145,0,0.15); border: 1px solid var(--harvest-orange); color: var(--harvest-orange); }}
             .host-chip {{ display: inline-block; padding: 5px 12px; margin: 3px; border-radius: 20px; font-size: 13px; background: rgba(0,229,255,0.1); border: 1px solid var(--whois-cyan); color: var(--whois-cyan); }}
+            .sev-badge {{ display: inline-block; padding: 2px 10px; border-radius: 3px; font-size: 11px; font-weight: bold; margin-right: 8px; text-transform: uppercase; }}
+            .sev-critical {{ background: var(--nuclei-crit); color: #000; }}
+            .sev-high {{ background: var(--nuclei-high); color: #000; }}
+            .sev-medium {{ background: var(--nuclei-med); color: #000; }}
+            .sev-low {{ background: var(--nuclei-low); color: #000; }}
+            .sev-info {{ background: #444; color: #fff; }}
+            .finding-item {{ padding: 10px 12px; border-left: 3px solid #333; margin: 6px 0; background: #0d0d0d; }}
+            .httpx-row {{ display: grid; grid-template-columns: 60px 1fr 120px 1fr; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #1a1a1a; font-size: 13px; }}
+            .httpx-row:hover {{ background: #111; }}
+            .status-2xx {{ color: #69f0ae; font-weight: bold; }}
+            .status-3xx {{ color: #ffb800; font-weight: bold; }}
+            .status-4xx {{ color: #ff9100; font-weight: bold; }}
+            .status-5xx {{ color: #ff1744; font-weight: bold; }}
+            .tech-pill {{ display: inline-block; padding: 2px 8px; margin: 2px; border-radius: 10px; font-size: 11px; background: rgba(64,196,255,0.15); border: 1px solid var(--katana-sky); color: var(--katana-sky); }}
             
             .dork-list {{ display: grid; grid-template-columns: 1fr; gap: 8px; }}
             .dork-item {{ background: #111; padding: 10px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #222; transition: 0.2s; }}
@@ -584,13 +963,17 @@ def generate_ghost_dashboard(target):
                 <h3>   created by: L4ZYG33K</h3>
                 <p>Target: <strong style="color: #fff;">{safe_target}</strong> {f"({target_ip})" if target_ip else ""}</p>
                 <div class="stats">
-                    Passive Subdomains Discovered: <strong style="color: var(--main-green);">{len(discovered_subdomains)}</strong> |
-                    Wayback Juicy Files: <strong style="color: var(--wayback-yellow);">{len(discovered_wayback_urls)}</strong> |
+                    Subdomains: <strong style="color: var(--main-green);">{len(all_subdomains)}</strong> |
+                    Resolved Live: <strong style="color: var(--dnsx-lime);">{len(resolved_hosts)}</strong> |
+                    Takeover Candidates: <strong style="color: var(--shodan-red);">{len(takeover_candidates)}</strong> |
+                    Wayback Files: <strong style="color: var(--wayback-yellow);">{len(discovered_wayback_urls)}</strong><br>
                     Open Ports: <strong style="color: var(--shodan-red);">{len(open_ports)}</strong> |
-                    CVEs: <strong style="color: var(--shodan-red);">{len(vulns)}</strong><br>
-                    Emails Harvested: <strong style="color: var(--harvest-orange);">{len(harvest_data['emails'])}</strong> |
-                    DNS Records: <strong style="color: var(--dns-purple);">{sum(len(v) for k, v in dns_records.items() if k in ['A','AAAA','MX','NS','TXT','SOA','CNAME'])}</strong> |
-                    Co-Hosted Domains: <strong style="color: var(--reverse-teal);">{len(co_hosted_domains)}</strong>
+                    CVEs: <strong style="color: var(--shodan-red);">{len(vulns)}</strong> |
+                    Emails: <strong style="color: var(--harvest-orange);">{len(harvest_data['emails'])}</strong> |
+                    Co-Hosted: <strong style="color: var(--reverse-teal);">{len(co_hosted_domains)}</strong><br>
+                    HTTP Hosts: <strong style="color: var(--httpx-pink);">{len(http_hosts)}</strong> |
+                    Endpoints: <strong style="color: var(--katana-sky);">{len(katana_endpoints)}</strong> |
+                    Nuclei Findings: <strong style="color: var(--nuclei-crit);">{len(nuclei_findings)}</strong>
                 </div>
             </header>
 
@@ -696,6 +1079,98 @@ def generate_ghost_dashboard(target):
                     <button class="copy-btn" data-dork="{safe_co}" onclick="copyToClipboard(this.getAttribute('data-dork'))">COPY</button>
                 </div>"""
         html_content += '</div></div>'
+
+
+    # NEW: Dnsx — Resolved Hosts & Takeover Candidates
+    if resolved_hosts or takeover_candidates:
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--dnsx-lime);">&#x1F9EC; Live Resolved Hosts (dnsx) &mdash; {len(resolved_hosts)} live</h2>"""
+        if takeover_candidates:
+            for tc in takeover_candidates:
+                safe_h = html.escape(tc['host'])
+                safe_c = html.escape(', '.join(tc.get('cname', [])))
+                html_content += f'<div class="security-note">&#x26A0; Takeover Candidate: <strong>{safe_h}</strong> &rarr; CNAME: {safe_c}</div>'
+        if resolved_hosts:
+            html_content += '<table class="intel-table" style="margin-top:10px;"><tr><td style="color:#888;width:40%">Host</td><td style="color:#888;">IPs</td></tr>'
+            for rh in resolved_hosts[:150]:
+                safe_h  = html.escape(rh['host'])
+                safe_ip = html.escape(', '.join(rh.get('ips', [])))
+                html_content += f'<tr><td style="color:var(--dnsx-lime);">{safe_h}</td><td style="color:#aaa;">{safe_ip}</td></tr>'
+            html_content += '</table>'
+        html_content += '</div>'
+
+    # NEW: HTTPx — Live HTTP Services
+    if http_hosts:
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--httpx-pink);">&#x1F310; Live HTTP Services (httpx) &mdash; {len(http_hosts)} hosts</h2>
+            <div style="font-size:12px;color:#555;margin-bottom:8px;">Status | URL | Server | Technologies</div>"""
+        for hh in http_hosts[:200]:
+            sc = hh.get("status", 0)
+            sc_class = "status-2xx" if 200<=sc<300 else "status-3xx" if 300<=sc<400 else "status-4xx" if 400<=sc<500 else "status-5xx"
+            safe_url   = html.escape(hh.get("url", ""))
+            safe_srv   = html.escape(hh.get("server", "") or "")
+            safe_title = html.escape(hh.get("title", "") or "")
+            tech_html  = "".join(
+                f'<span class="tech-pill">{html.escape(str(t))}</span>'
+                for t in (hh.get("tech") or [])[:6]
+            )
+            html_content += f'<div class="httpx-row"><span class="{sc_class}">{sc}</span><a href="{safe_url}" target="_blank" style="color:var(--httpx-pink);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{safe_title}">{safe_url}</a><span style="color:#666;font-size:12px;">{safe_srv}</span><span>{tech_html}</span></div>'
+        html_content += '</div>'
+
+    # NEW: Katana — Discovered Endpoints
+    if katana_endpoints:
+        sensitive_eps = [e for e in katana_endpoints if e.get("sensitive")]
+        api_eps       = [e for e in katana_endpoints if e.get("api")]
+        other_eps     = [e for e in katana_endpoints if not e.get("sensitive") and not e.get("api")]
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--katana-sky);">&#x1F578;&#xFE0F; Crawled Endpoints (katana) &mdash; {len(katana_endpoints)} total</h2>"""
+        if sensitive_eps:
+            html_content += f'<div style="margin-bottom:12px;"><strong style="color:#888;">Sensitive Files ({len(sensitive_eps)}):</strong><br>'
+            for e in sensitive_eps[:50]:
+                su = html.escape(e["url"])
+                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text" style="color:var(--shodan-red);">{su}</a><button class="copy-btn" onclick="copyToClipboard(\'{su}\')">COPY</button></div>'
+            html_content += '</div>'
+        if api_eps:
+            html_content += f'<div style="margin-bottom:12px;"><strong style="color:#888;">API Endpoints ({len(api_eps)}):</strong><br>'
+            for e in api_eps[:50]:
+                su = html.escape(e["url"])
+                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text" style="color:var(--katana-sky);">{su}</a><button class="copy-btn" onclick="copyToClipboard(\'{su}\')">COPY</button></div>'
+            html_content += '</div>'
+        if other_eps:
+            html_content += f'<div><strong style="color:#888;">Other Endpoints ({len(other_eps)}):</strong><br>'
+            for e in other_eps[:100]:
+                su = html.escape(e["url"])
+                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text">{su}</a><button class="copy-btn" onclick="copyToClipboard(\'{su}\')">COPY</button></div>'
+            html_content += '</div>'
+        html_content += '</div>'
+
+    # NEW: Nuclei — Vulnerability Findings
+    if nuclei_findings:
+        crit_count = sum(1 for f in nuclei_findings if f["severity"] == "critical")
+        high_count = sum(1 for f in nuclei_findings if f["severity"] == "high")
+        html_content += f"""
+        <div class="category-section">
+            <h2 style="color: var(--nuclei-crit);">&#x1F480; Nuclei Findings &mdash; {len(nuclei_findings)} total ({crit_count} critical, {high_count} high)</h2>"""
+        border_colors = {"critical":"var(--nuclei-crit)","high":"var(--nuclei-high)",
+                         "medium":"var(--nuclei-med)","low":"var(--nuclei-low)"}
+        for finding in nuclei_findings[:300]:
+            sev    = finding.get("severity", "info")
+            name   = html.escape(finding.get("name", ""))
+            tmpl   = html.escape(finding.get("template", ""))
+            furl   = html.escape(finding.get("url", ""))
+            desc   = html.escape(finding.get("description", "") or "")
+            refs   = finding.get("reference", []) or []
+            border = border_colors.get(sev, "#444")
+            ref_html = " ".join(
+                f'<a href="{html.escape(r)}" target="_blank" style="color:#555;font-size:11px;">[ref]</a>'
+                for r in refs[:3]
+            )
+            desc_html = f'<div style="color:#666;font-size:12px;margin-top:4px;">{desc}</div>' if desc else ''
+            html_content += f'<div class="finding-item" style="border-left-color:{border};"><div><span class="sev-badge sev-{sev}">{sev}</span><strong style="color:#ddd;">{name}</strong><span style="color:#555;font-size:12px;margin-left:8px;">[{tmpl}]</span> {ref_html}</div><div style="margin-top:4px;"><a href="{furl}" target="_blank" style="color:{border};font-size:13px;">{furl}</a></div>{desc_html}</div>'
+        html_content += '</div>'
 
     # 6. Inject Shodan Intel Section (FIXED WITH CSS OVERRIDE FOR WRAPPING)
     if open_ports or vulns:
@@ -806,15 +1281,70 @@ def generate_ghost_dashboard(target):
     filename = f"ghost_dorks_{target.replace('.', '_')}.html"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"\n[+] Ghost Dashboard Generated: {filename}")
+
+    # Also save a JSON summary alongside the HTML
+    json_filename = f"ghost_dorks_{target.replace('.', '_')}.json"
+    summary = {
+        "target": target,
+        "target_ip": target_ip,
+        "subdomains": all_subdomains,
+        "resolved_hosts": resolved_hosts,
+        "takeover_candidates": takeover_candidates,
+        "wayback_urls": discovered_wayback_urls,
+        "open_ports": open_ports,
+        "cves": vulns,
+        "emails": harvest_data.get("emails", []),
+        "harvested_hosts": harvest_data.get("hosts", []),
+        "co_hosted_domains": co_hosted_domains,
+        "naabu_ports": naabu_results,
+        "http_hosts": http_hosts,
+        "katana_endpoints": katana_endpoints,
+        "nuclei_findings": nuclei_findings,
+    }
+    with open(json_filename, "w", encoding="utf-8") as jf:
+        json.dump(summary, jf, indent=2)
+
+    print(f"\n[+] Ghost Dashboard Generated : {filename}")
+    print(f"[+] JSON Summary Saved        : {json_filename}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate an interactive OSINT HTML dashboard with passive scanning fallback.")
-    parser.add_argument("-d", "--domain", help="Target domain (e.g., example.com)", required=True)
+    parser = argparse.ArgumentParser(
+        description="PROJECT GHOST ENGINE — Passive OSINT Dashboard Generator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Passive only (default):
+    python ghostdorks.py -d example.com
+
+  With active scanning (naabu + httpx + katana):
+    python ghostdorks.py -d example.com --active
+
+  Full nuclear mode (active + nuclei vuln scan):
+    python ghostdorks.py -d example.com --active --nuclei
+
+  Throttle active tools:
+    python ghostdorks.py -d example.com --active --rate 300
+"""
+    )
+    parser.add_argument("-d", "--domain",
+        help="Target domain (e.g., example.com)", required=True)
+    parser.add_argument("--active", action="store_true",
+        help="Enable active scanning: naabu (port scan) + httpx (HTTP probe) + katana (crawl). "
+             "Sends packets directly to the target.")
+    parser.add_argument("--nuclei", action="store_true",
+        help="Enable nuclei vulnerability scanning (exposures + misconfigs + takeovers). "
+             "Requires --active or will auto-run httpx first. ONLY use with permission.")
+    parser.add_argument("--rate", type=int, default=1000, metavar="N",
+        help="Rate limit for active tools (packets/sec for naabu, req/sec for nuclei). "
+             "Default: 1000. Lower for stealth (e.g. 300).")
     args = parser.parse_args()
 
     domain = args.domain.strip()
     if domain:
-        generate_ghost_dashboard(domain)
+        generate_ghost_dashboard(domain, cfg={
+            "active":  args.active,
+            "nuclei":  args.nuclei,
+            "rate":    args.rate,
+        })
     else:
         print("[!] Domain cannot be empty.")
