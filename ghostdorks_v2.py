@@ -29,10 +29,10 @@ Active Modules (--active):
   • cPanel CVE-2026-41940 Remote Probe (WHM only)
 
 Usage:
-  python ghostreconv2.py -d example.com
-  python ghostreconv2.py -d example.com --active
-  python ghostreconv2.py -d example.com --active --nuclei --cpanel-probe --gf --arjun --subjack
-  python ghostreconv2.py -d example.com --dork-stealth --dg-categories sqli,osint,files
+  python ghostdorks_v2.py -d example.com
+  python ghostdorks_v2.py -d example.com --active
+  python ghostdorks_v2.py -d example.com --active --nuclei --cpanel-probe --gf --arjun --subjack
+  python ghostdorks_v2.py -d example.com --dork-stealth --dg-categories sqli,osint,files
 ================================================================================
 """
 
