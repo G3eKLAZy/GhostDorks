@@ -34,7 +34,7 @@ All results are compiled into a **self-contained, color-coded, searchable HTML d
 | **CVE-2026-41940 Assessment** | Passive regex + build database | Patch status: PATCHED / LIKELY_VULNERABLE / NO_VENDOR_PATCH / UNKNOWN |
 | **Subjack** | `subjack` | Subdomain takeover fingerprinting (when `--subjack` enabled) |
 | **GF Patterns** | `gf` | Pattern matching on endpoints for XSS, SQLi, SSRF, AWS keys, etc. (when `--gf` enabled) |
-| **Dork Engine** | DuckDuckGo (`ddgs`) + YAML templates | 400+ categorized dork queries across 20+ categories with automated result analysis |
+| **Dork Engine** | DuckDuckGo (`ddgs`) + YAML templates | 400+ categorized dork queries across 20 categories with automated result analysis |
 
 ### 🟡 Active Mode (`--active` flag — Light traffic, looks like a browser)
 
@@ -62,7 +62,7 @@ All results are compiled into a **self-contained, color-coded, searchable HTML d
 | Feature | Description |
 |---------|-------------|
 | DuckDuckGo Search | Real-time dork execution via `ddgs` library (falls back to static Google URLs if unavailable) |
-| 20+ Categories | sqli, xss, lfi_rfi, redirect, ssrf, files, secrets, admin, vuln, api, errors, docs, paste_git, takeover, cloud, dev, social, cpanel_hosting, database, iot, cms, osint, subdomain_recon |
+| 20 Categories | sqli, xss, lfi_rfi, redirect, ssrf, files, secrets, admin, vuln, api, errors, docs, paste_git, takeover, cloud, dev, social, cpanel_hosting, database, iot, cms, osint, subdomain_recon |
 | Pattern Analysis | Auto-detects PII, secrets (AWS keys, GitHub tokens, JWTs), vulnerability indicators (SQL errors, XSS, LFI, RCE), and sensitive file types |
 | Severity Ranking | Results tagged as critical / high / medium / low / info based on detected patterns |
 | Checkpoint/Resume | Saves progress after each dork; resume interrupted sessions with `--dork-resume` |
@@ -174,17 +174,28 @@ The generated HTML dashboard includes (in order):
 
 ## ⚙️ Prerequisites
 
-### Python
-Requires **Python 3.x** and the following libraries:
+### Python Environment (Kali Linux / PEP 668)
+
+Kali uses an **externally managed Python environment**. You must use a virtual environment to install `ddgs` and `pyyaml`.
 
 ```bash
-pip install requests
-# Optional but recommended:
-pip install ddgs        # For live DuckDuckGo dork searching
-pip install pyyaml      # For YAML template parsing (fallback parser included)
+cd ~/Desktop/myproject/ghostdorks
+
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install Python dependencies inside the venv
+pip install ddgs pyyaml
+
+# Optional: verify ddgs is working
+python -c "from ddgs import DDGS; print('DDGS OK')"
 ```
 
+> **Note:** Activate the venv every session: `source venv/bin/activate`
+
 ### Kali Linux Tools
+
 The following tools are **pre-installed on Kali Linux**. Ghost Engine will automatically skip any module whose tool is not found — no errors, no crashes.
 
 | Tool | Purpose | Install (if missing) |
@@ -207,9 +218,11 @@ The following tools are **pre-installed on Kali Linux**. Ghost Engine will autom
 
 ## 🚀 Usage
 
+> **All commands assume you are inside the virtual environment:** `source venv/bin/activate`
+
 ### Passive Only (Default — Safe, no target contact)
 ```bash
-python ghostreconv2.py -d target.com
+python ghostdorks_v2.py -d target.com
 ```
 
 ### With Active Scanning (naabu + httpx + katana)
