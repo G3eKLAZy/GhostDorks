@@ -953,12 +953,16 @@ class DorkEngine:
         return False
 
     def _is_relevant_result(self, url, title, dork):
-        """Validate that a DDGS result actually relates to the target domain."""
+        """Validate that a DDGS result actually relates to the target domain.
+
+        FIX: Relaxed filtering to allow more dork URLs through to downstream tools.
+        """
         if not url:
             return False
         url_lower = url.lower()
         title_lower = title.lower()
         target = self.domain.lower()
+        target_root = target.split('.')[0]  # e.g., 'ckcgingoog' from 'ckcgingoog.edu.ph'
         combined = f"{url_lower} {title_lower}"
 
         # Blacklist: known search/aggregator domains that are never relevant
@@ -975,21 +979,32 @@ class DorkEngine:
                 return False
 
         # If the dork explicitly scopes to our target via site:, enforce it
-        # (DDGS sometimes ignores or misinterprets the site: operator)
+        # BUT be more lenient - allow if target is in URL or title
         if 'site:' in dork:
             m = re.search(r'site:([^\s]+)', dork)
             if m:
                 site_val = m.group(1).replace('{target}', self.domain).lower().strip()
                 site_val_clean = site_val.replace('*', '').lstrip('.')
-                if site_val_clean and site_val_clean in self.domain.lower():
-                    if target not in url_lower:
-                        return False
+                if site_val_clean:
+                    # Allow if target appears anywhere in URL or title
+                    if target in combined:
+                        return True
+                    # Also allow subdomain matches
+                    if site_val_clean in url_lower or site_val_clean in title_lower:
+                        return True
+                    # For wildcard site:*.target, allow any related URL
+                    if '*' in site_val and target_root in combined:
+                        return True
 
         # Primary: target domain must appear in URL or title
         if target in combined:
             return True
 
-        # Secondary: for known paste/code/leak sites, allow if target in title
+        # Secondary: target root word (e.g., 'ckcgingoog') in URL
+        if target_root and len(target_root) > 3 and target_root in url_lower:
+            return True
+
+        # Tertiary: for known paste/code/leak sites, allow if target in title
         allowed_leak_sites = [
             'pastebin.com', 'github.com', 'gist.github.com',
             'gitlab.com', 'bitbucket.org', 'controlc.com',
@@ -997,7 +1012,7 @@ class DorkEngine:
             'medium.com', 'twitter.com', 'reddit.com'
         ]
         if any(d in url_lower for d in allowed_leak_sites):
-            if target in title_lower:
+            if target in title_lower or target_root in title_lower:
                 return True
 
         return False
@@ -1454,39 +1469,80 @@ def fetch_emails_theharvester(domain):
         return harvest_data
     tmp_dir = tempfile.mkdtemp(prefix="ghostdorks_")
     output_base = os.path.join(tmp_dir, "harvest")
+    # FIX: theHarvester writes to CWD, not tmp_dir. Use CWD paths.
+    cwd_json = "harvest.json"
+    cwd_xml = "harvest.xml"
     try:
         result = subprocess.run(
             ["theHarvester", "-d", domain, "-b", "anubis,crtsh,dnsdumpster,duckduckgo,hackertarget,rapiddns,urlscan",
              "-l", "200", "-f", output_base],
             capture_output=True, text=True, timeout=120
         )
-        json_path = output_base + ".json"
-        local_json_path = "harvest.json"
+        # FIX: Check multiple possible JSON locations since -f behavior varies by version
         target_json = None
-        if os.path.exists(json_path): target_json = json_path
-        elif os.path.exists(local_json_path): target_json = local_json_path
+        possible_paths = [
+            output_base + ".json",           # /tmp/ghostdorks_XXXXX/harvest.json
+            output_base + "_json.json",      # Some versions append _json
+            cwd_json,                         # CWD: harvest.json (most common!)
+            os.path.join(os.getcwd(), cwd_json),
+            os.path.join(os.getcwd(), "harvest_json.json")
+        ]
+        for path in possible_paths:
+            if os.path.exists(path) and os.path.getsize(path) > 10:
+                target_json = path
+                break
+
         if target_json:
-            with open(target_json, 'r') as f:
-                data = json.load(f)
-            harvest_data["emails"] = sorted(set(data.get("emails", [])))
-            harvest_data["hosts"] = sorted(set(data.get("hosts", [])))
-            harvest_data["ips"] = sorted(set(data.get("ips", [])))
-            print(f"[+] theHarvester found: {len(harvest_data['emails'])} emails, {len(harvest_data['hosts'])} hosts, {len(harvest_data['ips'])} IPs")
+            try:
+                with open(target_json, 'r') as f:
+                    data = json.load(f)
+                harvest_data["emails"] = sorted(set(data.get("emails", [])))
+                harvest_data["hosts"] = sorted(set(data.get("hosts", [])))
+                harvest_data["ips"] = sorted(set(data.get("ips", [])))
+                print(f"[+] theHarvester JSON loaded from {target_json}: {len(harvest_data['emails'])} emails, {len(harvest_data['hosts'])} hosts, {len(harvest_data['ips'])} IPs")
+            except Exception as e:
+                print(f"[-] Error parsing theHarvester JSON from {target_json}: {e}")
         else:
-            print("[-] theHarvester JSON output not found, parsing stdout...")
-            email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-            found_emails = email_pattern.findall(result.stdout)
-            harvest_data["emails"] = sorted(set(found_emails))
-            if harvest_data["emails"]:
-                print(f"[+] Parsed {len(harvest_data['emails'])} emails from stdout.")
-            else:
-                print("[-] No emails found.")
+            print("[-] theHarvester JSON output not found in any expected location.")
+
+        # Always parse stdout as fallback/primary for emails and hosts
+        email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+        found_emails = email_pattern.findall(result.stdout)
+        if found_emails:
+            existing = set(harvest_data["emails"])
+            new_emails = [e for e in found_emails if e not in existing]
+            harvest_data["emails"].extend(new_emails)
+            harvest_data["emails"] = sorted(set(harvest_data["emails"]))
+            print(f"[+] Parsed {len(found_emails)} emails from stdout. Total unique: {len(harvest_data['emails'])}")
+        elif not harvest_data["emails"]:
+            print("[-] No emails found in stdout either.")
+
+        # Parse hosts from stdout too
+        host_pattern = re.compile(r'\[\*\] Hosts found:\s*([\d]+)', re.I)
+        if host_pattern.search(result.stdout):
+            # Extract host lines from stdout
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line and not line.startswith(('[*]', '[-]', '[!]', 'Read', 'An exception', 'Failed', 'Error')):
+                    if '.' in line and ' ' not in line and ':' not in line.split('.')[0]:
+                        if line not in harvest_data["hosts"] and domain in line:
+                            harvest_data["hosts"].append(line)
+            harvest_data["hosts"] = sorted(set(harvest_data["hosts"]))
+
     except Exception as e:
         print(f"[-] Error running theHarvester: {e}")
     finally:
+        # Cleanup temp dir AND CWD files
         try:
             import shutil as sh
             sh.rmtree(tmp_dir, ignore_errors=True)
+            # Clean up CWD harvest files if they exist
+            for f in ["harvest.json", "harvest.xml", "harvest_html.html", "harvest_json.json"]:
+                if os.path.exists(f):
+                    try:
+                        os.unlink(f)
+                    except:
+                        pass
         except Exception:
             pass
     return harvest_data
@@ -1607,58 +1663,111 @@ def run_naabu(resolved_hosts, rate=1000):
 def run_httpx(resolved_hosts, naabu_results=None, dork_results=None):
     print(f"[*] Running httpx to probe live HTTP services...")
     http_hosts = []
-    if not resolved_hosts and not dork_results:
-        return http_hosts
     if not shutil.which("httpx"):
         print("[-] 'httpx' not found. Skipping.")
         return http_hosts
     try:
         targets = []
+
+        # Priority 1: naabu results with HTTP ports
         if naabu_results:
             valid_http_ports = {80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 8081, 9000,
-                    2082, 2083, 2086, 2087, 2095, 2096, 2077, 2078, 2079}  # cPanel/WHM/Webmail ports
-            targets = list(set(f"{r['host']}:{r['port']}" for r in naabu_results if int(r['port']) in valid_http_ports))
-        # PIPELINE: If naabu found nothing, try resolved hosts directly
-        if not targets and resolved_hosts:
-            print("[*] naabu found no standard HTTP ports. Falling back to resolved hosts with https:// prefix...")
-            targets = [f"https://{h['host']}" for h in resolved_hosts if h.get('host')]
-            targets += [f"http://{h['host']}" for h in resolved_hosts if h.get('host')]
-            targets = list(dict.fromkeys(targets))  # deduplicate preserve order
-        # PIPELINE: If still nothing, try dork results as seeds
-        if not targets and dork_results:
-            print("[*] No resolved hosts to probe. Using dork engine results as httpx seeds...")
+                    2082, 2083, 2086, 2087, 2095, 2096, 2077, 2078, 2079}
+            naabu_targets = list(set(f"{r['host']}:{r['port']}" for r in naabu_results if int(r['port']) in valid_http_ports))
+            if naabu_targets:
+                targets.extend(naabu_targets)
+                print(f"[*] Using {len(naabu_targets)} naabu-discovered HTTP ports")
+
+        # Priority 2: resolved hosts with standard protocols
+        if resolved_hosts:
+            host_targets = []
+            for h in resolved_hosts:
+                if h.get('host'):
+                    host_targets.append(f"https://{h['host']}")
+                    host_targets.append(f"http://{h['host']}")
+            if host_targets:
+                targets.extend(host_targets)
+                print(f"[*] Using {len(host_targets)} resolved host URLs")
+
+        # Priority 3: dork result URLs directly (extract hosts)
+        if dork_results:
             dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
-            # Extract host from dork URLs
-            from urllib.parse import urlparse
-            dork_hosts = []
-            for url in dork_urls[:50]:  # limit to top 50
+            dork_hosts = set()
+            for url in dork_urls[:100]:
                 try:
                     parsed = urlparse(url)
                     if parsed.netloc:
-                        dork_hosts.append(parsed.netloc)
+                        dork_hosts.add(parsed.netloc)
                 except:
                     continue
-            targets = list(dict.fromkeys(dork_hosts))
+            if dork_hosts:
+                for host in dork_hosts:
+                    targets.append(f"https://{host}")
+                    targets.append(f"http://{host}")
+                print(f"[*] Using {len(dork_hosts)} unique hosts from dork results")
+
+        # Deduplicate while preserving order
+        targets = list(dict.fromkeys(targets))
+
+        if not targets:
+            print("[-] No targets to probe with httpx.")
+            return http_hosts
+
+        print(f"[*] httpx targets ({len(targets)}): {', '.join(targets[:5])}{'...' if len(targets) > 5 else ''}")
+
+        # FIX: Use -l file instead of stdin pipe (httpx sometimes ignores stdin)
         tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_httpx_', delete=False)
         tmp.write('\n'.join(targets))
         tmp.close()
-        proc = subprocess.run(["httpx", "-l", tmp.name, "-status-code", "-title", "-server", "-tech-detect", "-follow-redirects", "-json", "-silent", "-threads", "50"], capture_output=True, text=True, timeout=300)
+
+        proc = subprocess.run(
+            ["httpx", "-l", tmp.name, "-status-code", "-title", "-server", "-tech-detect", 
+             "-follow-redirects", "-json", "-silent", "-threads", "50", 
+             "-timeout", "15"],
+            capture_output=True, text=True, timeout=300
+        )
         os.unlink(tmp.name)
+
+        if proc.stderr:
+            err_lines = proc.stderr.strip().splitlines()
+            if err_lines:
+                print(f"[*] httpx stderr: {err_lines[:3]}")
+
         for line in proc.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
                 entry = json.loads(line)
                 url = entry.get("url", "")
                 if not url:
                     continue
+                status = entry.get("status_code", entry.get("status-code", 0))
+                if isinstance(status, str):
+                    try:
+                        status = int(status)
+                    except:
+                        status = 0
                 http_hosts.append({
                     "url": url,
-                    "status": entry.get("status_code", entry.get("status-code", 0)),
-                    "title": entry.get("title", ""),
+                    "status": status,
+                    "title": entry.get("title", "") or entry.get("page_title", ""),
                     "server": entry.get("webserver", entry.get("server", "")),
-                    "tech": entry.get("tech", []),
+                    "tech": entry.get("tech", []) or entry.get("technologies", []),
                     "content_length": entry.get("content_length", entry.get("content-length", 0)),
                 })
             except json.JSONDecodeError:
+                if line.startswith("http"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        http_hosts.append({
+                            "url": parts[0],
+                            "status": 0,
+                            "title": "",
+                            "server": "",
+                            "tech": [],
+                            "content_length": 0,
+                        })
                 continue
         print(f"[+] httpx found {len(http_hosts)} live HTTP endpoint(s).")
     except subprocess.TimeoutExpired:
@@ -1669,45 +1778,59 @@ def run_httpx(resolved_hosts, naabu_results=None, dork_results=None):
         print(f"[-] httpx error: {e}")
     return http_hosts
 
-def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True, dork_results=None):
+def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True, dork_results=None, existing_endpoints=None):
     mode_str = "passive (Wayback/CommonCrawl)" if passive else "active crawl"
     print(f"[*] Running katana [{mode_str}] for endpoint discovery...")
-    endpoints = []
+    endpoints = list(existing_endpoints) if existing_endpoints else []
     if not shutil.which("katana"):
         print("[-] 'katana' not found. Skipping.")
         return endpoints
     try:
-        tmp = None
+        new_endpoints = []
+        targets = []
+
         if passive:
-            targets = [h["host"] for h in (resolved_hosts or [])] or [domain]
-            # PIPELINE: Enrich with dork result URLs for passive crawling
+            targets = [h["host"] for h in (resolved_hosts or []) if h.get("host")] or [domain]
+            # Enrich with dork result URLs for passive crawling
             if dork_results:
                 dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
-                targets = list(dict.fromkeys(targets + dork_urls[:30]))  # add top 30 dork URLs
-            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_katana_passive_', delete=False)
-            tmp.write('\n'.join(targets))
-            tmp.close()
-            cmd = ["katana", "-list", tmp.name, "-ps", "-jsonl", "-silent"]
+                targets = list(dict.fromkeys(targets + dork_urls[:30]))
+            cmd = ["katana", "-ps", "-jsonl", "-silent", "-nc", "-no-color"]
         else:
-            targets = [h["url"] for h in (http_hosts or [])] or [f"https://{domain}"]
-            # PIPELINE: If no http_hosts, seed active crawl with dork results
+            targets = [h["url"] for h in (http_hosts or []) if h.get("url")] or [f"https://{domain}"]
+            # If no http_hosts, seed active crawl with dork results
             if not http_hosts and dork_results:
                 print("[*] No http_hosts for active katana. Using dork results as seeds...")
                 dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
                 targets = list(dict.fromkeys(targets + dork_urls[:20]))
-            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_katana_active_', delete=False)
-            tmp.write('\n'.join(targets))
-            tmp.close()
-            cmd = ["katana", "-list", tmp.name, "-d", "3", "-jc", "-jsonl", "-silent", "-c", "20"]
+            cmd = ["katana", "-d", "3", "-jc", "-jsonl", "-silent", "-c", "20", "-nc", "-no-color"]
+
+        if not targets:
+            print("[-] No targets for katana.")
+            return endpoints
+
+        print(f"[*] katana input targets ({len(targets)}): {', '.join(targets[:3])}{'...' if len(targets) > 3 else ''}")
+
+        # FIX: Use -l file instead of stdin
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_katana_', delete=False)
+        tmp.write('\n'.join(targets))
+        tmp.close()
+        cmd.extend(["-list", tmp.name])
+
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if tmp:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+        os.unlink(tmp.name)
+
+        if proc.stderr:
+            err_lines = proc.stderr.strip().splitlines()
+            if err_lines:
+                print(f"[*] katana stderr: {err_lines[:3]}")
+
         sensitive_ext = {'.env', '.sql', '.bak', '.json', '.xml', '.yaml', '.yml', '.log', '.conf', '.config', '.key', '.pem'}
         api_patterns = re.compile(r'/(api|v\d|graphql|rest|swagger|openapi)', re.I)
         for line in proc.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
                 entry = json.loads(line)
                 url = entry.get("request", {}).get("endpoint", "") or entry.get("endpoint", "")
@@ -1716,10 +1839,24 @@ def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True, dork_
                 ext = os.path.splitext(url.split('?')[0])[1].lower()
                 is_sensitive = ext in sensitive_ext
                 is_api = bool(api_patterns.search(url))
-                endpoints.append({"url": url, "sensitive": is_sensitive, "api": is_api})
+                new_endpoints.append({"url": url, "sensitive": is_sensitive, "api": is_api})
             except (json.JSONDecodeError, AttributeError):
+                if line.startswith(("http://", "https://")):
+                    url = line.split()[0] if ' ' in line else line
+                    ext = os.path.splitext(url.split('?')[0])[1].lower()
+                    is_sensitive = ext in sensitive_ext
+                    is_api = bool(api_patterns.search(url))
+                    new_endpoints.append({"url": url, "sensitive": is_sensitive, "api": is_api})
                 continue
-        print(f"[+] katana discovered {len(endpoints)} endpoint(s).")
+
+        # Merge with existing, deduplicate by URL
+        seen = {e["url"] for e in endpoints}
+        for ne in new_endpoints:
+            if ne["url"] not in seen:
+                endpoints.append(ne)
+                seen.add(ne["url"])
+
+        print(f"[+] katana [{mode_str}] discovered {len(new_endpoints)} new endpoint(s). Total: {len(endpoints)}.")
     except subprocess.TimeoutExpired:
         print("[-] katana timed out.")
     except KeyboardInterrupt:
@@ -1735,31 +1872,54 @@ def run_nuclei(http_hosts, katana_endpoints=None, rate=150, dork_results=None):
         print("[-] 'nuclei' not found. Skipping.")
         return findings
 
-    # PIPELINE: Build targets from all upstream sources
+    # Build targets from ALL upstream sources (not just one)
     targets = []
+
     if katana_endpoints:
-        targets = list(set(e["url"] for e in katana_endpoints))[:500]
-    elif http_hosts:
-        targets = [h["url"] for h in http_hosts][:500]
-    # PIPELINE: Fallback to dork results if no HTTP hosts or katana endpoints
-    elif dork_results:
+        kat_targets = list(set(e["url"] for e in katana_endpoints))[:500]
+        if kat_targets:
+            targets.extend(kat_targets)
+            print(f"[*] Using {len(kat_targets)} katana endpoints")
+
+    if http_hosts:
+        http_targets = [h["url"] for h in http_hosts][:500]
+        if http_targets:
+            targets.extend(http_targets)
+            print(f"[*] Using {len(http_targets)} httpx hosts")
+
+    if not targets and dork_results:
         print("[*] No HTTP hosts or katana endpoints. Using dork results as nuclei targets...")
         dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
         targets = list(dict.fromkeys(dork_urls))[:500]
+        print(f"[*] Using {len(targets)} dork result URLs")
 
     if not targets:
         print("[-] No HTTP targets for nuclei. Skipping.")
         return findings
+
+    # Deduplicate
+    targets = list(dict.fromkeys(targets))
+    print(f"[*] Total unique nuclei targets: {len(targets)}")
+
     try:
         tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_nuclei_', delete=False)
         tmp.write('\n'.join(targets))
         tmp.close()
+        print(f"[*] Nuclei target file: {tmp.name}")
+
         proc = subprocess.run(
             ["nuclei", "-l", tmp.name, "-t", "exposures/", "-t", "misconfiguration/", "-t", "takeovers/",
              "-severity", "critical,high,medium,low", "-rate-limit", str(rate), "-json", "-silent", "-no-color"],
             capture_output=True, text=True, timeout=600
         )
         os.unlink(tmp.name)
+
+        # Also check stderr for nuclei template errors
+        if proc.stderr:
+            err_lines = proc.stderr.strip().splitlines()
+            if err_lines and not all("no templates" in l.lower() for l in err_lines):
+                print(f"[*] nuclei stderr: {err_lines[:3]}")
+
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
         for line in proc.stdout.strip().splitlines():
             try:
@@ -1794,24 +1954,48 @@ def run_nuclei(http_hosts, katana_endpoints=None, rate=150, dork_results=None):
 # NEW: gf, arjun, subjack Integrations
 # ─────────────────────────────────────────────
 
-def run_gf(endpoints, wayback_urls=None, dork_results=None):
-    """Run gf pattern matching on katana endpoints + wayback URLs."""
-    print(f"[*] Running gf pattern matching on {len(endpoints)} endpoints...")
-    # PIPELINE: Build URL list from all upstream sources
+def run_gf(endpoints, wayback_urls=None, dork_results=None, target_domain=None):
+    """Run gf pattern matching on katana endpoints + wayback URLs + dork results.
+
+    FIX: More lenient URL filtering and ensures dork results always feed GF.
+    """
+    # Build URL list from all upstream sources
     all_urls = []
     if endpoints:
-        all_urls.extend([e["url"] for e in endpoints])
+        all_urls.extend([e["url"] for e in endpoints if e.get("url")])
     if wayback_urls:
-        all_urls.extend(wayback_urls)
-    # PIPELINE: Fallback to dork results if primary sources are empty
-    if not all_urls and dork_results:
-        print("[*] No katana/wayback endpoints. Using dork results as GF input...")
+        all_urls.extend([u for u in wayback_urls if u.startswith(("http://", "https://"))])
+    # Always include dork results as enrichment (not just fallback)
+    if dork_results:
         dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
         all_urls.extend(dork_urls)
+        if not endpoints and not wayback_urls:
+            print(f"[*] Using {len(dork_urls)} dork result URLs as GF input")
+
+    # Filter to target domain - but be more lenient
+    if target_domain:
+        target_lower = target_domain.lower()
+        target_root = target_lower.split('.')[0]
+        filtered_urls = []
+        for url in all_urls:
+            try:
+                parsed = urlparse(url)
+                netloc = parsed.netloc.lower() if parsed.netloc else ""
+                # Allow if domain contains target or target root
+                if target_lower in netloc or target_root in netloc:
+                    filtered_urls.append(url)
+                else:
+                    # Also allow if path contains target
+                    if target_lower in parsed.path.lower() or target_root in parsed.path.lower():
+                        filtered_urls.append(url)
+            except:
+                if target_lower in url.lower() or target_root in url.lower():
+                    filtered_urls.append(url)
+        all_urls = filtered_urls
 
     all_urls = sorted(set(all_urls))
-
     print(f"[*] Running gf pattern matching on {len(all_urls)} URLs...")
+
     gf_results = {}
     if not shutil.which("gf"):
         print("[-] 'gf' not found. Skipping gf module.")
@@ -1826,51 +2010,74 @@ def run_gf(endpoints, wayback_urls=None, dork_results=None):
         print("[-] No URLs to analyze with gf.")
         return gf_results
 
+    # Run gf from isolated temp dir to avoid searching venv/
+    tmp_dir = tempfile.mkdtemp(prefix="ghostdorks_gf_run_")
+    tmp_file = os.path.join(tmp_dir, "urls.txt")
+
     try:
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_gf_', delete=False)
-        tmp.write('\n'.join(all_urls))
-        tmp.close()
+        with open(tmp_file, 'w') as f:
+            f.write('\n'.join(all_urls))
+            f.write('\n')
 
         for pattern in patterns:
             try:
                 proc = subprocess.run(
-                    ["bash", "-c", f"cat {tmp.name} | gf {pattern}"],
-                    capture_output=True, text=True, timeout=60
+                    ["bash", "-c", f"cat urls.txt | gf {pattern}"],
+                    capture_output=True, text=True, timeout=60,
+                    cwd=tmp_dir
                 )
                 matches = [line.strip() for line in proc.stdout.strip().splitlines() if line.strip()]
-                if matches:
-                    gf_results[pattern] = matches
-                    print(f"    [+] gf {pattern}: {len(matches)} matches")
+                valid_matches = [m for m in matches if m.startswith(("http://", "https://", "/", "?", ";")) or "." in m]
+                if valid_matches:
+                    gf_results[pattern] = valid_matches
+                    print(f"    [+] gf {pattern}: {len(valid_matches)} matches")
             except Exception as e:
                 continue
 
-        os.unlink(tmp.name)
         total = sum(len(v) for v in gf_results.values())
         print(f"[+] gf analysis complete. {total} total pattern matches across {len(gf_results)} patterns.")
     except Exception as e:
         print(f"[-] gf error: {e}")
+    finally:
+        try:
+            import shutil as sh
+            sh.rmtree(tmp_dir, ignore_errors=True)
+        except:
+            pass
     return gf_results
 
 def run_arjun(http_hosts, dork_results=None, gf_results=None):
-    """Run arjun hidden parameter discovery on live HTTP hosts."""
-    # PIPELINE: Build targets from upstream sources
+    """Run arjun hidden parameter discovery on live HTTP hosts.
+
+    FIX: Builds targets from ALL upstream sources simultaneously, not sequentially.
+    """
     targets = []
+
+    # Priority 1: http_hosts
     if http_hosts:
-        targets = list(set(h["url"] for h in http_hosts))[:50]
+        http_targets = list(set(h["url"] for h in http_hosts))[:50]
+        targets.extend(http_targets)
+        print(f"[*] Arjun using {len(http_targets)} httpx hosts")
 
-    # PIPELINE: If no http_hosts, use GF matches as arjun targets (interesting URLs)
-    if not targets and gf_results:
-        print("[*] No http_hosts for arjun. Using GF pattern matches as targets...")
+    # Priority 2: GF interesting matches (ALWAYS use as enrichment)
+    if gf_results:
+        gf_targets = []
         for pattern, matches in gf_results.items():
-            if pattern in ["sqli", "xss", "ssrf", "idor", "lfi", "rce", "redirect"]:
-                targets.extend(matches[:15])  # top 15 matches per interesting pattern
-        targets = list(dict.fromkeys(targets))[:50]
+            if pattern in ["sqli", "xss", "ssrf", "idor", "lfi", "rce", "redirect", "upload-fields"]:
+                gf_targets.extend(matches[:15])
+        if gf_targets:
+            targets.extend(gf_targets)
+            print(f"[*] Arjun using {len(gf_targets)} GF pattern match URLs")
 
-    # PIPELINE: Last resort - use dork results directly
-    if not targets and dork_results:
-        print("[*] No GF matches either. Using dork results as arjun targets...")
+    # Priority 3: dork results (ALWAYS use as enrichment)
+    if dork_results:
         dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
-        targets = list(dict.fromkeys(dork_urls))[:50]
+        if dork_urls:
+            targets.extend(dork_urls[:30])
+            print(f"[*] Arjun using {len(dork_urls[:30])} dork result URLs")
+
+    # Deduplicate and limit
+    targets = list(dict.fromkeys(targets))[:50]
 
     print(f"[*] Running arjun for hidden parameter discovery on {len(targets)} hosts...")
     arjun_results = []
@@ -1884,12 +2091,14 @@ def run_arjun(http_hosts, dork_results=None, gf_results=None):
 
     for target in targets:
         try:
+            # Use unique output file per target to avoid collisions
+            out_file = f"/tmp/arjun_ghostdorks_{hashlib.md5(target.encode()).hexdigest()[:8]}.json"
             proc = subprocess.run(
-                ["arjun", "-u", target, "-oJ", "-o", "/tmp/arjun_ghostdorks.json", "-t", "20"],
+                ["arjun", "-u", target, "-oJ", "-o", out_file, "-t", "20", "--stable"],
                 capture_output=True, text=True, timeout=120
             )
-            if os.path.exists("/tmp/arjun_ghostdorks.json"):
-                with open("/tmp/arjun_ghostdorks.json", 'r') as f:
+            if os.path.exists(out_file):
+                with open(out_file, 'r') as f:
                     data = json.load(f)
                 for entry in data:
                     arjun_results.append({
@@ -1898,8 +2107,9 @@ def run_arjun(http_hosts, dork_results=None, gf_results=None):
                         "method": entry.get("method", "GET"),
                         "type": entry.get("type", "query")
                     })
-                os.unlink("/tmp/arjun_ghostdorks.json")
+                os.unlink(out_file)
         except Exception as e:
+            print(f"[-] arjun error for {target}: {e}")
             continue
 
     total_params = sum(len(r["params"]) for r in arjun_results)
@@ -1907,7 +2117,10 @@ def run_arjun(http_hosts, dork_results=None, gf_results=None):
     return arjun_results
 
 def run_subjack(subdomains):
-    """Run subjack subdomain takeover check on all discovered subdomains."""
+    """Run subjack subdomain takeover check on all discovered subdomains.
+
+    FIX: Better output parsing and includes all subjack output lines.
+    """
     print(f"[*] Running subjack on {len(subdomains)} subdomains...")
     subjack_results = []
     if not shutil.which("subjack"):
@@ -1925,16 +2138,29 @@ def run_subjack(subdomains):
         )
         os.unlink(tmp.name)
 
+        # Parse all output lines - subjack format varies
         for line in proc.stdout.strip().splitlines():
-            if "[Vulnerable]" in line or "dead" in line.lower() or "takeover" in line.lower():
+            line = line.strip()
+            if not line:
+                continue
+
+            # Check for vulnerable indicators
+            is_vulnerable = "[Vulnerable]" in line or "dead" in line.lower() or "takeover" in line.lower()
+            is_potential = any(w in line.lower() for w in ["error", "not found", "nxdomain", "servfail", "refused"])
+
+            if is_vulnerable or is_potential:
                 parts = line.split()
                 host = parts[0] if parts else ""
                 service = ""
                 status = "CONFIRMED" if "[Vulnerable]" in line else "POTENTIAL"
 
                 # Extract service name if present
+                services = ["github", "heroku", "aws", "azure", "fastly", "shopify", "pantheon", 
+                           "tumblr", "wordpress", "teamwork", "helpjuice", "helpscout", "feedpress", 
+                           "surge", "webflow", "kajabi", "jetbrains", "cloudfront", "zendesk", "readme",
+                           "netlify", "vercel", "firebase", "digitalocean", "linode"]
                 for p in parts:
-                    if any(s in p.lower() for s in ["github", "heroku", "aws", "azure", "fastly", "shopify", "pantheon", "tumblr", "wordpress", "teamwork", "helpjuice", "helpscout", "feedpress", "surge", "webflow", "kajabi", "jetbrains", "cloudfront", "zendesk", "readme"]):
+                    if any(s in p.lower() for s in services):
                         service = p
                         break
 
@@ -1946,7 +2172,11 @@ def run_subjack(subdomains):
                 })
 
         confirmed = sum(1 for r in subjack_results if r["status"] == "CONFIRMED")
-        print(f"[+] subjack found {len(subjack_results)} takeovers ({confirmed} confirmed, {len(subjack_results)-confirmed} potential).")
+        potential = len(subjack_results) - confirmed
+        if subjack_results:
+            print(f"[+] subjack found {len(subjack_results)} takeovers ({confirmed} confirmed, {potential} potential).")
+        else:
+            print("[-] subjack found no takeover vulnerabilities.")
     except subprocess.TimeoutExpired:
         print("[-] subjack timed out.")
     except KeyboardInterrupt:
@@ -1999,20 +2229,43 @@ def fetch_geo_ip(ip):
     return {}
 
 def extract_ssl_info(target, port):
-    """Extract SSL certificate info using openssl."""
+    """Extract SSL certificate info using openssl with proper error handling."""
     if not shutil.which("openssl"):
+        print("[-] 'openssl' command not found. Skipping SSL extraction.")
         return ""
+
+    # Try with SNI first (for proper cert extraction)
+    cmd = f"echo | openssl s_client -connect {target}:{port} -servername {target} 2>/dev/null | openssl x509 -noout -text 2>/dev/null"
     try:
         result = subprocess.run(
-            ["bash", "-c", f"echo | openssl s_client -connect {target}:{port} 2>/dev/null | openssl x509 -noout -text 2>/dev/null"],
+            ["bash", "-c", cmd],
             capture_output=True, text=True, timeout=15
         )
-        lines = []
-        for line in result.stdout.splitlines():
-            if any(k in line for k in ["Subject:", "Issuer:", "DNS:", "Not Before", "Not After"]):
-                lines.append(line.strip())
-        return "\n".join(lines)
-    except Exception:
+        if not result.stdout.strip():
+            # Fallback: try without SNI (for IP connections)
+            cmd_fallback = f"echo | openssl s_client -connect {target}:{port} 2>/dev/null | openssl x509 -noout -text 2>/dev/null"
+            result = subprocess.run(
+                ["bash", "-c", cmd_fallback],
+                capture_output=True, text=True, timeout=15
+            )
+
+        if result.stdout.strip():
+            lines = []
+            for line in result.stdout.splitlines():
+                if any(k in line for k in ["Subject:", "Issuer:", "DNS:", "Not Before", "Not After", "Public Key Algorithm:"]):
+                    lines.append(line.strip())
+            ssl_output = "\n".join(lines)
+            if ssl_output:
+                print(f"[+] SSL certificate extracted for {target}:{port}")
+            return ssl_output
+        else:
+            print(f"[-] OpenSSL returned empty output for {target}:{port}")
+            return ""
+    except subprocess.TimeoutExpired:
+        print(f"[-] OpenSSL command timed out for {target}:{port}")
+        return ""
+    except Exception as e:
+        print(f"[-] OpenSSL error for {target}:{port}: {e}")
         return ""
 
 def extract_passive_versions(body, headers_text):
@@ -2135,12 +2388,22 @@ def calculate_cpanel_risk(service_type, patch_status, probe_status, has_security
     else:
         return "LOW", score
 
-def detect_cpanel_services(target, active_probe=False):
+def detect_cpanel_services(target, active_probe=False, subdomains=None):
     """
     Detect cPanel/WHM on ports 2083/2087.
+    FIX: Also checks cPanel-related subdomains (cpanel.*, webmail.*, whm.*, webdisk.*)
     Returns dict with all recon data or None if not detected.
     """
     print(f"[*] Checking {target} for cPanel/WHM on ports 2083/2087...")
+
+    # Build list of targets to check: main domain + cPanel subdomains
+    targets_to_check = [target]
+    if subdomains:
+        cpanel_subs = [s for s in subdomains if any(x in s.lower() for x in ['cpanel', 'webmail', 'whm', 'webdisk'])]
+        targets_to_check.extend(cpanel_subs)
+        targets_to_check = list(dict.fromkeys(targets_to_check))  # dedup
+        if cpanel_subs:
+            print(f"[*] Also checking cPanel subdomains: {', '.join(cpanel_subs[:5])}")
 
     cpanel_data = {
         "detected": False,
@@ -2164,119 +2427,132 @@ def detect_cpanel_services(target, active_probe=False):
         "body_snippet": ""
     }
 
-    for port in [2083, 2087]:
-        url = f"https://{target}:{port}"
-        try:
-            start = time.time()
-            response = requests.get(
-                url, headers={"User-Agent": pick_ua()}, 
-                timeout=CPANEL_TIMEOUT, verify=False,
-                allow_redirects=True
-            )
-            elapsed = time.time() - start
-            size = len(response.content)
-
-            if not validate_cpanel_response(response.text, size):
+    for check_target in targets_to_check:
+        if cpanel_data["detected"]:
+            break
+        for port in [2083, 2087]:
+            url = f"https://{check_target}:{port}"
+            try:
+                start = time.time()
+                response = requests.get(
+                    url, headers={"User-Agent": pick_ua()}, 
+                    timeout=CPANEL_TIMEOUT, verify=False,
+                    allow_redirects=True
+                )
+                elapsed = time.time() - start
+                size = len(response.content)
+    
+                # DEBUG: Always show response info, even if not cPanel
+                if size > 0:
+                    print(f"[*] {check_target}:{port} -> HTTP {response.status_code}, size={size}B")
+                    body_lower = response.text.lower()
+                    markers = [m for m in ['cpanel', 'whm', 'cpsrvd', 'cprelogin', 'webhost manager'] if m in body_lower]
+                    if markers:
+                        print(f"[*] Found cPanel markers: {markers}")
+    
+                if not validate_cpanel_response(response.text, size):
+                    continue
+    
+                cpanel_data["detected"] = True
+                cpanel_data["port"] = port
+                cpanel_data["service_type"] = "cPanel" if port == 2083 else "WHM"
+                cpanel_data["body_size"] = size
+                cpanel_data["response_time"] = round(elapsed, 2)
+                cpanel_data["headers"] = "\n".join([f"{k}: {v}" for k, v in response.headers.items()])
+                cpanel_data["body_snippet"] = response.text[:2000]
+    
+                print(f"[!] {cpanel_data['service_type']} Detected on {check_target}:{port} (size: {size}B, time: {elapsed:.2f}s)")
+    
+                # Infrastructure
+                cpanel_data["target_ip"] = extract_ip_info(check_target)
+                if cpanel_data["target_ip"]:
+                    print(f"[+] IP: {cpanel_data['target_ip']}")
+                    cpanel_data["geo_data"] = fetch_geo_ip(cpanel_data["target_ip"])
+                    if cpanel_data["geo_data"].get("country"):
+                        print(f"[+] Geo: {cpanel_data['geo_data'].get('city', 'N/A')}, {cpanel_data['geo_data'].get('country', 'N/A')} — {cpanel_data['geo_data'].get('isp', 'N/A')}")
+    
+                # Headers & Hardening
+                headers_lower = cpanel_data["headers"].lower()
+                cpanel_data["security_headers"] = any(h in headers_lower for h in [
+                    'x-frame-options', 'x-content-type-options', 'content-security-policy', 'strict-transport-security'
+                ])
+                cpanel_data["letsencrypt"] = "let's encrypt" in headers_lower
+    
+                if cpanel_data["security_headers"]:
+                    print("[+] Security headers present")
+                else:
+                    print("[-] Missing security headers (X-Frame-Options, X-Content-Type-Options, HSTS, CSP)")
+                if cpanel_data["letsencrypt"]:
+                    print("[+] Certificate: Let's Encrypt")
+    
+                # SSL
+                cpanel_data["ssl_info"] = extract_ssl_info(check_target, port)
+                if cpanel_data["ssl_info"]:
+                    print("[+] SSL certificate data extracted")
+    
+                # Passive Version Fingerprinting
+                cpanel_data["versions"] = extract_passive_versions(response.text, cpanel_data["headers"])
+                if cpanel_data["versions"]:
+                    print(f"[+] Extracted version indicators: {', '.join(cpanel_data['versions'][:10])}")
+                else:
+                    print("[-] No version indicators found in passive content")
+    
+                # Patch Assessment
+                patch_status, patch_detail = assess_patch_status(cpanel_data["versions"])
+                cpanel_data["patch_status"] = patch_status
+                cpanel_data["patch_detail"] = patch_detail
+    
+                status_colors = {
+                    "PATCHED": "[+]",
+                    "NO_VENDOR_PATCH": "[!!!] CRITICAL:",
+                    "LIKELY_VULNERABLE": "[!] WARNING:",
+                    "UNKNOWN": "[?]"
+                }
+                print(f"{status_colors.get(patch_status, '[?]')} CVE-2026-41940 Patch Status: {patch_detail}")
+    
+                # Active Probe (WHM only, if enabled)
+                if active_probe and cpanel_data["service_type"] == "WHM":
+                    print("\n--- ACTIVE REMOTE PROBE (CVE-2026-41940) ---")
+                    probe_status, probe_detail = probe_cve_2026_41940(check_target, port)
+                    cpanel_data["probe_status"] = probe_status
+                    cpanel_data["probe_detail"] = probe_detail
+    
+                    if probe_status == "VULNERABLE":
+                        print(f"[!!!] VULNERABLE: {probe_detail}")
+                    elif probe_status == "SAFE":
+                        print(f"[+] SAFE: {probe_detail}")
+                    else:
+                        print(f"[?] INCONCLUSIVE: {probe_detail}")
+    
+                # Risk Score
+                risk_level, risk_score = calculate_cpanel_risk(
+                    cpanel_data["service_type"], patch_status, 
+                    cpanel_data["probe_status"], cpanel_data["security_headers"], cpanel_data["letsencrypt"]
+                )
+                cpanel_data["risk_level"] = risk_level
+                cpanel_data["risk_score"] = risk_score
+    
+                if risk_level == "CRITICAL":
+                    print(f"\n[!!!] RISK LEVEL: {risk_level} (score: {risk_score})\n      ACTION REQUIRED: Assume compromise risk. Firewall 2083/2087 immediately.")
+                elif risk_level == "HIGH":
+                    print(f"\n[!] RISK LEVEL: {risk_level} (score: {risk_score})\n      ACTION REQUIRED: Patch or restrict access urgently.")
+                else:
+                    print(f"\n[!] RISK LEVEL: {risk_level} (score: {risk_score})")
+    
+                return cpanel_data
+    
+            except requests.exceptions.Timeout:
+                print(f"[-] {check_target}:{port} timed out")
+                continue
+            except requests.exceptions.ConnectionError as ce:
+                print(f"[-] {check_target}:{port} connection error: {str(ce)[:80]}")
+                continue
+            except Exception as e:
+                print(f"[-] Error checking {check_target}:{port}: {e}")
                 continue
 
-            cpanel_data["detected"] = True
-            cpanel_data["port"] = port
-            cpanel_data["service_type"] = "cPanel" if port == 2083 else "WHM"
-            cpanel_data["body_size"] = size
-            cpanel_data["response_time"] = round(elapsed, 2)
-            cpanel_data["headers"] = "\n".join([f"{k}: {v}" for k, v in response.headers.items()])
-            cpanel_data["body_snippet"] = response.text[:2000]
-
-            print(f"[!] {cpanel_data['service_type']} Detected on port {port} (size: {size}B, time: {elapsed:.2f}s)")
-
-            # Infrastructure
-            cpanel_data["target_ip"] = extract_ip_info(target)
-            if cpanel_data["target_ip"]:
-                print(f"[+] IP: {cpanel_data['target_ip']}")
-                cpanel_data["geo_data"] = fetch_geo_ip(cpanel_data["target_ip"])
-                if cpanel_data["geo_data"].get("country"):
-                    print(f"[+] Geo: {cpanel_data['geo_data'].get('city', 'N/A')}, {cpanel_data['geo_data'].get('country', 'N/A')} — {cpanel_data['geo_data'].get('isp', 'N/A')}")
-
-            # Headers & Hardening
-            headers_lower = cpanel_data["headers"].lower()
-            cpanel_data["security_headers"] = any(h in headers_lower for h in [
-                'x-frame-options', 'x-content-type-options', 'content-security-policy', 'strict-transport-security'
-            ])
-            cpanel_data["letsencrypt"] = "let's encrypt" in headers_lower
-
-            if cpanel_data["security_headers"]:
-                print("[+] Security headers present")
-            else:
-                print("[-] Missing security headers (X-Frame-Options, X-Content-Type-Options, HSTS, CSP)")
-            if cpanel_data["letsencrypt"]:
-                print("[+] Certificate: Let's Encrypt")
-
-            # SSL
-            cpanel_data["ssl_info"] = extract_ssl_info(target, port)
-            if cpanel_data["ssl_info"]:
-                print("[+] SSL certificate data extracted")
-
-            # Passive Version Fingerprinting
-            cpanel_data["versions"] = extract_passive_versions(response.text, cpanel_data["headers"])
-            if cpanel_data["versions"]:
-                print(f"[+] Extracted version indicators: {', '.join(cpanel_data['versions'][:10])}")
-            else:
-                print("[-] No version indicators found in passive content")
-
-            # Patch Assessment
-            patch_status, patch_detail = assess_patch_status(cpanel_data["versions"])
-            cpanel_data["patch_status"] = patch_status
-            cpanel_data["patch_detail"] = patch_detail
-
-            status_colors = {
-                "PATCHED": "[+]",
-                "NO_VENDOR_PATCH": "[!!!] CRITICAL:",
-                "LIKELY_VULNERABLE": "[!] WARNING:",
-                "UNKNOWN": "[?]"
-            }
-            print(f"{status_colors.get(patch_status, '[?]')} CVE-2026-41940 Patch Status: {patch_detail}")
-
-            # Active Probe (WHM only, if enabled)
-            if active_probe and cpanel_data["service_type"] == "WHM":
-                print("\n--- ACTIVE REMOTE PROBE (CVE-2026-41940) ---")
-                probe_status, probe_detail = probe_cve_2026_41940(target, port)
-                cpanel_data["probe_status"] = probe_status
-                cpanel_data["probe_detail"] = probe_detail
-
-                if probe_status == "VULNERABLE":
-                    print(f"[!!!] VULNERABLE: {probe_detail}")
-                elif probe_status == "SAFE":
-                    print(f"[+] SAFE: {probe_detail}")
-                else:
-                    print(f"[?] INCONCLUSIVE: {probe_detail}")
-
-            # Risk Score
-            risk_level, risk_score = calculate_cpanel_risk(
-                cpanel_data["service_type"], patch_status, 
-                cpanel_data["probe_status"], cpanel_data["security_headers"], cpanel_data["letsencrypt"]
-            )
-            cpanel_data["risk_level"] = risk_level
-            cpanel_data["risk_score"] = risk_score
-
-            if risk_level == "CRITICAL":
-                print(f"\n[!!!] RISK LEVEL: {risk_level} (score: {risk_score})\n      ACTION REQUIRED: Assume compromise risk. Firewall 2083/2087 immediately.")
-            elif risk_level == "HIGH":
-                print(f"\n[!] RISK LEVEL: {risk_level} (score: {risk_score})\n      ACTION REQUIRED: Patch or restrict access urgently.")
-            else:
-                print(f"\n[!] RISK LEVEL: {risk_level} (score: {risk_score})")
-
-            return cpanel_data
-
-        except requests.exceptions.Timeout:
-            continue
-        except requests.exceptions.ConnectionError:
-            continue
-        except Exception as e:
-            print(f"[-] Error checking port {port}: {e}")
-            continue
-
     if not cpanel_data["detected"]:
-        print(f"[-] No cPanel/WHM detected on {target} (ports 2083/2087).")
+        print(f"[-] No cPanel/WHM detected on {target} or its subdomains (ports 2083/2087).")
     return cpanel_data
 
 
@@ -2373,8 +2649,8 @@ def generate_ghost_dashboard(target, cfg=None):
     if do_subjack:
         subjack_results = run_subjack(all_subdomains)
 
-    # cPanel/WHM Detection
-    cpanel_data = detect_cpanel_services(target, active_probe=cpanel_probe)
+    # cPanel/WHM Detection - now passes subdomains to check cPanel subdomains
+    cpanel_data = detect_cpanel_services(target, active_probe=cpanel_probe, subdomains=all_subdomains)
 
     # ═══════════════════════════════════════════════════════════
     # PIPELINED ACTIVE RECON CHAIN
@@ -2402,12 +2678,13 @@ def generate_ghost_dashboard(target, cfg=None):
     #   http_hosts → dork results
     if active and (http_hosts or dork_results):
         katana_endpoints = run_katana(target, http_hosts=http_hosts, resolved_hosts=resolved_hosts, 
-                                       passive=False, dork_results=dork_results)
+                                       passive=False, dork_results=dork_results, 
+                                       existing_endpoints=katana_endpoints)
 
     # Stage 4: GF pattern matching with fallback chain:
     #   katana endpoints + wayback → dork results
     if do_gf:
-        gf_results = run_gf(katana_endpoints, discovered_wayback_urls, dork_results=dork_results)
+        gf_results = run_gf(katana_endpoints, discovered_wayback_urls, dork_results=dork_results, target_domain=target)
 
     # Stage 5: Arjun parameter discovery with fallback chain:
     #   http_hosts → GF interesting matches → dork results
@@ -2722,40 +2999,67 @@ def build_html_dashboard(target, safe_target, target_ip, all_subdomains, resolve
 
         body_html += '</div>'
 
-    # cPanel Section
-    if cpanel_data["detected"]:
-        risk_class = {"CRITICAL": "risk-critical", "HIGH": "risk-high", "MEDIUM": "risk-medium", "LOW": "risk-low", "N/A": "risk-na"}.get(cpanel_data["risk_level"], "risk-na")
-        patch_badge = {"PATCHED": "badge-patched", "LIKELY_VULNERABLE": "badge-vulnerable", "NO_VENDOR_PATCH": "badge-nopatch", "UNKNOWN": "badge-unknown"}.get(cpanel_data["patch_status"], "badge-unknown")
-        probe_badge = {"VULNERABLE": "badge-vulnerable", "SAFE": "badge-patched", "INCONCLUSIVE": "badge-unknown", "NOT_TESTED": "badge-unknown"}.get(cpanel_data["probe_status"], "badge-unknown")
-        geo_str = ""
-        if cpanel_data.get("geo_data"):
-            gd = cpanel_data["geo_data"]
-            geo_str = f"{gd.get('city', 'N/A')}, {gd.get('country', 'N/A')} - {gd.get('isp', 'N/A')}"
-        ns_list = ", ".join(whois_info.get("name_servers", [])) or "N/A"
+    # cPanel Section - ALWAYS show, with appropriate status
+    risk_class = {"CRITICAL": "risk-critical", "HIGH": "risk-high", "MEDIUM": "risk-medium", "LOW": "risk-low", "N/A": "risk-na"}.get(cpanel_data.get("risk_level", "N/A"), "risk-na")
+    patch_badge = {"PATCHED": "badge-patched", "LIKELY_VULNERABLE": "badge-vulnerable", "NO_VENDOR_PATCH": "badge-nopatch", "UNKNOWN": "badge-unknown"}.get(cpanel_data.get("patch_status", "UNKNOWN"), "badge-unknown")
+    probe_badge = {"VULNERABLE": "badge-vulnerable", "SAFE": "badge-patched", "INCONCLUSIVE": "badge-unknown", "NOT_TESTED": "badge-unknown"}.get(cpanel_data.get("probe_status", "NOT_TESTED"), "badge-unknown")
+    geo_str = ""
+    if cpanel_data.get("geo_data"):
+        gd = cpanel_data["geo_data"]
+        geo_str = f"{gd.get('city', 'N/A')}, {gd.get('country', 'N/A')} - {gd.get('isp', 'N/A')}"
+    ns_list = ", ".join(whois_info.get("name_servers", [])) or "N/A"
 
+    if cpanel_data.get("detected"):
+        # cPanel WAS detected - show full details
         body_html += f"""
         <div class="category-section cpanel-banner">
-            <h2>cPanel/WHM Reconnaissance & CVE-2026-41940 Triage</h2>
+            <h2>🎯 cPanel/WHM Reconnaissance & CVE-2026-41940 Triage</h2>
+            <div style="margin-bottom: 10px; padding: 8px; background: rgba(255,111,0,0.05); border-left: 3px solid var(--cpanel-orange); color: var(--cpanel-orange); font-size: 13px;">
+                <strong>Status:</strong> {html.escape(cpanel_data.get("service_type", "UNKNOWN"))} detected on port {cpanel_data.get("port", "N/A")}
+            </div>
             <table class="intel-table">
-                <tr><td>Service</td><td><strong style="color: var(--cpanel-orange);">{html.escape(cpanel_data["service_type"])}</strong> on port {cpanel_data["port"]} ({cpanel_data["body_size"]}B, {cpanel_data["response_time"]}s)</td></tr>
-                <tr><td>Target IP</td><td>{html.escape(cpanel_data["target_ip"] or "N/A")}</td></tr>
-                <tr><td>Geolocation</td><td>{html.escape(geo_str)}</td></tr>
-                <tr><td>Risk Level</td><td><span class="{risk_class}">{html.escape(cpanel_data["risk_level"])}</span> (score: {cpanel_data["risk_score"]})</td></tr>
-                <tr><td>Patch Status</td><td><span class="cpanel-badge {patch_badge}">{html.escape(cpanel_data["patch_status"])}</span> - {html.escape(cpanel_data["patch_detail"])}</td></tr>
-                <tr><td>Probe Status</td><td><span class="cpanel-badge {probe_badge}">{html.escape(cpanel_data["probe_status"])}</span> - {html.escape(cpanel_data["probe_detail"])}</td></tr>
-                <tr><td>Security Headers</td><td>{"Present" if cpanel_data["security_headers"] else "Missing (X-Frame-Options, X-Content-Type-Options, HSTS, CSP)"}</td></tr>
-                <tr><td>Certificate</td><td>{"Let's Encrypt" if cpanel_data["letsencrypt"] else "Other / Unknown"}</td></tr>
-                <tr><td>Version Indicators</td><td>{', '.join(html.escape(v) for v in cpanel_data["versions"][:15]) or "None extracted"}</td></tr>
+                <tr><td>Service</td><td><strong style="color: var(--cpanel-orange);">{html.escape(cpanel_data.get("service_type", "N/A"))}</strong> on port {cpanel_data.get("port", "N/A")} ({cpanel_data.get("body_size", 0)}B, {cpanel_data.get("response_time", 0)}s)</td></tr>
+                <tr><td>Target IP</td><td>{html.escape(cpanel_data.get("target_ip") or "N/A")}</td></tr>
+                <tr><td>Geolocation</td><td>{html.escape(geo_str) or "N/A"}</td></tr>
+                <tr><td>Risk Level</td><td><span class="{risk_class}">{html.escape(cpanel_data.get("risk_level", "N/A"))}</span> (score: {cpanel_data.get("risk_score", 0)})</td></tr>
+                <tr><td>Patch Status</td><td><span class="cpanel-badge {patch_badge}">{html.escape(cpanel_data.get("patch_status", "UNKNOWN"))}</span> - {html.escape(cpanel_data.get("patch_detail", "N/A"))}</td></tr>
+                <tr><td>Probe Status</td><td><span class="cpanel-badge {probe_badge}">{html.escape(cpanel_data.get("probe_status", "NOT_TESTED"))}</span> - {html.escape(cpanel_data.get("probe_detail", "N/A"))}</td></tr>
+                <tr><td>Security Headers</td><td>{"✅ Present" if cpanel_data.get("security_headers") else "❌ Missing (X-Frame-Options, X-Content-Type-Options, HSTS, CSP)"}</td></tr>
+                <tr><td>Certificate</td><td>{"Let's Encrypt" if cpanel_data.get("letsencrypt") else "Other / Unknown"}</td></tr>
+                <tr><td>Version Indicators</td><td>{', '.join(html.escape(v) for v in cpanel_data.get("versions", [])[:15]) or "None extracted"}</td></tr>
                 <tr><td>Name Servers</td><td>{html.escape(ns_list)}</td></tr>
             </table>
         """
-        if cpanel_data["ssl_info"]:
+        if cpanel_data.get("ssl_info"):
             body_html += f'<div style="margin-top: 12px;"><strong style="color: #888;">SSL Certificate Info:</strong><div class="code-block">{html.escape(cpanel_data["ssl_info"])}</div></div>'
-        if cpanel_data["headers"]:
+        if cpanel_data.get("headers"):
             body_html += f'<div style="margin-top: 12px;"><strong style="color: #888;">Response Headers:</strong><div class="code-block">{html.escape(cpanel_data["headers"])}</div></div>'
-        if cpanel_data["body_snippet"]:
+        if cpanel_data.get("body_snippet"):
             body_html += f'<div style="margin-top: 12px;"><strong style="color: #888;">Body Snippet:</strong><div class="code-block">{html.escape(cpanel_data["body_snippet"][:1500])}</div></div>'
         body_html += '</div>'
+    else:
+        # cPanel NOT detected - show status card anyway
+        body_html += f"""
+        <div class="category-section cpanel-banner">
+            <h2>🎯 cPanel/WHM Reconnaissance & CVE-2026-41940 Triage</h2>
+            <div style="margin-bottom: 10px; padding: 10px; background: rgba(100,100,100,0.05); border-left: 3px solid #666; color: #888; font-size: 13px;">
+                <strong>Status:</strong> No cPanel/WHM services detected on ports 2083/2087
+            </div>
+            <table class="intel-table">
+                <tr><td>Detection</td><td><span class="cpanel-badge badge-unknown">NOT DETECTED</span> — cPanel/WHM not found on standard ports (2083, 2087)</td></tr>
+                <tr><td>Risk Level</td><td><span class="risk-na">N/A</span> (no cPanel services to assess)</td></tr>
+                <tr><td>Patch Status</td><td><span class="cpanel-badge badge-unknown">UNKNOWN</span> — No cPanel instance to patch-check</td></tr>
+                <tr><td>Probe Status</td><td><span class="cpanel-badge badge-unknown">NOT TESTED</span> — No WHM endpoint available for CVE-2026-41940 probe</td></tr>
+                <tr><td>Security Headers</td><td>N/A</td></tr>
+                <tr><td>Certificate</td><td>N/A</td></tr>
+                <tr><td>Version Indicators</td><td>None extracted</td></tr>
+                <tr><td>Name Servers</td><td>{html.escape(ns_list)}</td></tr>
+            </table>
+            <div style="margin-top: 12px; color: #555; font-size: 12px;">
+                <strong>Note:</strong> cPanel/WHM detection only checks ports 2083 (cPanel) and 2087 (WHM). 
+                If the target uses non-standard ports or has cPanel behind a reverse proxy, manual verification is recommended.
+            </div>
+        </div>"""
 
     # subjack Section
     if subjack_results:
