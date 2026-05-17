@@ -2188,8 +2188,7 @@ def generate_ghost_dashboard(target, cfg=None):
     safe_target = html.escape(target)
 
     print("\n" + "="*55)
-    print("  PROJECT GHOST ENGINE - Unified Recon Pipeline v5.0")
-    print("  DorkEye Dork Engine | gf | arjun | subjack | cPanel Triage")
+    print("  PROJECT GHOST ENGINE - Unified Recon Pipeline v2.0")
     print("="*55)
     if active:
         print("  ACTIVE MODE enabled (naabu + httpx + katana)")
@@ -2340,6 +2339,7 @@ def build_html_dashboard(target, safe_target, target_ip, all_subdomains, resolve
                          arjun_results, nuclei_findings, subjack_results, cpanel_data,
                          dork_results, dork_engine, dork_map):
     """Build the complete HTML dashboard."""
+    dork_by_severity = dork_engine.get_results_by_severity()
 
     # CSS
     css = """
