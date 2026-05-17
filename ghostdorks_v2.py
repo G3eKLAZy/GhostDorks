@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-GHOSTRECON v2 — Unified OSINT & cPanel/WHM Reconnaissance Engine
+GHOSTDORKS v2 — Unified OSINT & cPanel/WHM Reconnaissance Engine
 Created by: L4ZYG33K | Project Ghost Dork Engine 
 ================================================================================
 Passive Modules (always run):
