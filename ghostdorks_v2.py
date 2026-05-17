@@ -103,7 +103,7 @@ CPANEL_CONNECT_TIMEOUT = 8
 PROBE_TIMEOUT = 20
 
 # ─────────────────────────────────────────────
-# DorkEye-inspired Dork Engine
+# Project Ghost Dork Engine
 # ─────────────────────────────────────────────
 
 DORK_TEMPLATES_YAML = """
@@ -757,7 +757,7 @@ DORK_PATTERNS = {
 # ─────────────────────────────────────────────
 
 class SessionCheckpoint:
-    """DorkEye-inspired session checkpoint/resume system."""
+    """Project Ghost Dork Engine session checkpoint/resume system."""
 
     def __init__(self, session_id, checkpoint_dir=".checkpoints"):
         self.session_id = session_id
