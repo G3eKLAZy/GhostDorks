@@ -704,9 +704,9 @@ categories:
       - 'site:{target} inurl:mail'
       - 'site:{target} inurl:ftp'
       - 'site:{target} inurl:cdn'
-      - 'allintitle:"index of/admin"'
-      - 'allintitle:"index of/root"'
-      - 'allintitle:restricted filetype:mail'
+      - 'allintitle:"index of/admin" site:{target}'
+      - 'allintitle:"index of/root" site:{target}'
+      - 'allintitle:restricted filetype:mail site:{target}'
       - 'site:{target} inurl:vpn'
       - 'site:*.{target} inurl:portal'
       - 'site:*.{target} inurl:secure'
@@ -952,6 +952,56 @@ class DorkEngine:
         self.url_hashes.add(url_hash)
         return False
 
+    def _is_relevant_result(self, url, title, dork):
+        """Validate that a DDGS result actually relates to the target domain."""
+        if not url:
+            return False
+        url_lower = url.lower()
+        title_lower = title.lower()
+        target = self.domain.lower()
+        combined = f"{url_lower} {title_lower}"
+
+        # Blacklist: known search/aggregator domains that are never relevant
+        # unless the target itself is that domain
+        blacklist_domains = [
+            'bing.com', 'google.com', 'googleusercontent.com',
+            'duckduckgo.com', 'yahoo.com', 'baidu.com',
+            'microsoft.com', 'facebook.com', 'twitter.com',
+            'linkedin.com', 'youtube.com', 'reddit.com',
+            'amazon.com', 'cloudflare.com'
+        ]
+        for bad in blacklist_domains:
+            if bad in url_lower and target not in bad:
+                return False
+
+        # If the dork explicitly scopes to our target via site:, enforce it
+        # (DDGS sometimes ignores or misinterprets the site: operator)
+        if 'site:' in dork:
+            m = re.search(r'site:([^\s]+)', dork)
+            if m:
+                site_val = m.group(1).replace('{target}', self.domain).lower().strip()
+                site_val_clean = site_val.replace('*', '').lstrip('.')
+                if site_val_clean and site_val_clean in self.domain.lower():
+                    if target not in url_lower:
+                        return False
+
+        # Primary: target domain must appear in URL or title
+        if target in combined:
+            return True
+
+        # Secondary: for known paste/code/leak sites, allow if target in title
+        allowed_leak_sites = [
+            'pastebin.com', 'github.com', 'gist.github.com',
+            'gitlab.com', 'bitbucket.org', 'controlc.com',
+            'ideone.com', 'stackoverflow.com', 'stackexchange.com',
+            'medium.com', 'twitter.com', 'reddit.com'
+        ]
+        if any(d in url_lower for d in allowed_leak_sites):
+            if target in title_lower:
+                return True
+
+        return False
+
     def _analyze_url(self, url, title=""):
         """Analyze URL for patterns (PII, secrets, vuln indicators)."""
         patterns_found = []
@@ -1034,7 +1084,7 @@ class DorkEngine:
                 if isinstance(item, dict):
                     url = item.get("href", "")
                     title = item.get("title", "")
-                    if url and not self._is_duplicate(url):
+                    if url and not self._is_duplicate(url) and self._is_relevant_result(url, title, dork):
                         urls.append((url, title))
             except queue.Empty:
                 continue
@@ -1554,10 +1604,10 @@ def run_naabu(resolved_hosts, rate=1000):
         print(f"[-] naabu error: {e}")
     return port_results
 
-def run_httpx(resolved_hosts, naabu_results=None):
+def run_httpx(resolved_hosts, naabu_results=None, dork_results=None):
     print(f"[*] Running httpx to probe live HTTP services...")
     http_hosts = []
-    if not resolved_hosts:
+    if not resolved_hosts and not dork_results:
         return http_hosts
     if not shutil.which("httpx"):
         print("[-] 'httpx' not found. Skipping.")
@@ -1565,10 +1615,30 @@ def run_httpx(resolved_hosts, naabu_results=None):
     try:
         targets = []
         if naabu_results:
-            valid_http_ports = {80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 8081, 9000}
+            valid_http_ports = {80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 8081, 9000,
+                    2082, 2083, 2086, 2087, 2095, 2096, 2077, 2078, 2079}  # cPanel/WHM/Webmail ports
             targets = list(set(f"{r['host']}:{r['port']}" for r in naabu_results if int(r['port']) in valid_http_ports))
-        if not targets:
-            targets = [h["host"] for h in resolved_hosts]
+        # PIPELINE: If naabu found nothing, try resolved hosts directly
+        if not targets and resolved_hosts:
+            print("[*] naabu found no standard HTTP ports. Falling back to resolved hosts with https:// prefix...")
+            targets = [f"https://{h['host']}" for h in resolved_hosts if h.get('host')]
+            targets += [f"http://{h['host']}" for h in resolved_hosts if h.get('host')]
+            targets = list(dict.fromkeys(targets))  # deduplicate preserve order
+        # PIPELINE: If still nothing, try dork results as seeds
+        if not targets and dork_results:
+            print("[*] No resolved hosts to probe. Using dork engine results as httpx seeds...")
+            dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
+            # Extract host from dork URLs
+            from urllib.parse import urlparse
+            dork_hosts = []
+            for url in dork_urls[:50]:  # limit to top 50
+                try:
+                    parsed = urlparse(url)
+                    if parsed.netloc:
+                        dork_hosts.append(parsed.netloc)
+                except:
+                    continue
+            targets = list(dict.fromkeys(dork_hosts))
         tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_httpx_', delete=False)
         tmp.write('\n'.join(targets))
         tmp.close()
@@ -1599,7 +1669,7 @@ def run_httpx(resolved_hosts, naabu_results=None):
         print(f"[-] httpx error: {e}")
     return http_hosts
 
-def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True):
+def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True, dork_results=None):
     mode_str = "passive (Wayback/CommonCrawl)" if passive else "active crawl"
     print(f"[*] Running katana [{mode_str}] for endpoint discovery...")
     endpoints = []
@@ -1610,12 +1680,21 @@ def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True):
         tmp = None
         if passive:
             targets = [h["host"] for h in (resolved_hosts or [])] or [domain]
+            # PIPELINE: Enrich with dork result URLs for passive crawling
+            if dork_results:
+                dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
+                targets = list(dict.fromkeys(targets + dork_urls[:30]))  # add top 30 dork URLs
             tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_katana_passive_', delete=False)
             tmp.write('\n'.join(targets))
             tmp.close()
             cmd = ["katana", "-list", tmp.name, "-ps", "-jsonl", "-silent"]
         else:
             targets = [h["url"] for h in (http_hosts or [])] or [f"https://{domain}"]
+            # PIPELINE: If no http_hosts, seed active crawl with dork results
+            if not http_hosts and dork_results:
+                print("[*] No http_hosts for active katana. Using dork results as seeds...")
+                dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
+                targets = list(dict.fromkeys(targets + dork_urls[:20]))
             tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_katana_active_', delete=False)
             tmp.write('\n'.join(targets))
             tmp.close()
@@ -1649,19 +1728,28 @@ def run_katana(domain, http_hosts=None, resolved_hosts=None, passive=True):
         print(f"[-] katana error: {e}")
     return endpoints
 
-def run_nuclei(http_hosts, katana_endpoints=None, rate=150):
+def run_nuclei(http_hosts, katana_endpoints=None, rate=150, dork_results=None):
     print(f"[*] Running nuclei vulnerability scan (rate={rate})...")
     findings = []
-    if not http_hosts and not katana_endpoints:
-        print("[-] No HTTP targets for nuclei. Skipping.")
-        return findings
     if not shutil.which("nuclei"):
         print("[-] 'nuclei' not found. Skipping.")
         return findings
+
+    # PIPELINE: Build targets from all upstream sources
+    targets = []
     if katana_endpoints:
         targets = list(set(e["url"] for e in katana_endpoints))[:500]
-    else:
-        targets = [h["url"] for h in http_hosts]
+    elif http_hosts:
+        targets = [h["url"] for h in http_hosts][:500]
+    # PIPELINE: Fallback to dork results if no HTTP hosts or katana endpoints
+    elif dork_results:
+        print("[*] No HTTP hosts or katana endpoints. Using dork results as nuclei targets...")
+        dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
+        targets = list(dict.fromkeys(dork_urls))[:500]
+
+    if not targets:
+        print("[-] No HTTP targets for nuclei. Skipping.")
+        return findings
     try:
         tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_nuclei_', delete=False)
         tmp.write('\n'.join(targets))
@@ -1706,9 +1794,24 @@ def run_nuclei(http_hosts, katana_endpoints=None, rate=150):
 # NEW: gf, arjun, subjack Integrations
 # ─────────────────────────────────────────────
 
-def run_gf(endpoints, wayback_urls=None):
+def run_gf(endpoints, wayback_urls=None, dork_results=None):
     """Run gf pattern matching on katana endpoints + wayback URLs."""
     print(f"[*] Running gf pattern matching on {len(endpoints)} endpoints...")
+    # PIPELINE: Build URL list from all upstream sources
+    all_urls = []
+    if endpoints:
+        all_urls.extend([e["url"] for e in endpoints])
+    if wayback_urls:
+        all_urls.extend(wayback_urls)
+    # PIPELINE: Fallback to dork results if primary sources are empty
+    if not all_urls and dork_results:
+        print("[*] No katana/wayback endpoints. Using dork results as GF input...")
+        dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
+        all_urls.extend(dork_urls)
+
+    all_urls = sorted(set(all_urls))
+
+    print(f"[*] Running gf pattern matching on {len(all_urls)} URLs...")
     gf_results = {}
     if not shutil.which("gf"):
         print("[-] 'gf' not found. Skipping gf module.")
@@ -1718,12 +1821,6 @@ def run_gf(endpoints, wayback_urls=None):
     patterns = ["xss", "sqli", "ssrf", "redirect", "aws-keys", "s3-buckets", 
                 "debug-pages", "base64", "jwt", "idor", "lfi", "rce", 
                 "takeovers", "upload-fields", "php-errors", "git", "cors"]
-
-    # Combine endpoints and wayback URLs
-    all_urls = [e["url"] for e in endpoints]
-    if wayback_urls:
-        all_urls.extend(wayback_urls)
-    all_urls = sorted(set(all_urls))
 
     if not all_urls:
         print("[-] No URLs to analyze with gf.")
@@ -1754,16 +1851,36 @@ def run_gf(endpoints, wayback_urls=None):
         print(f"[-] gf error: {e}")
     return gf_results
 
-def run_arjun(http_hosts):
+def run_arjun(http_hosts, dork_results=None, gf_results=None):
     """Run arjun hidden parameter discovery on live HTTP hosts."""
-    print(f"[*] Running arjun for hidden parameter discovery on {len(http_hosts)} hosts...")
+    # PIPELINE: Build targets from upstream sources
+    targets = []
+    if http_hosts:
+        targets = list(set(h["url"] for h in http_hosts))[:50]
+
+    # PIPELINE: If no http_hosts, use GF matches as arjun targets (interesting URLs)
+    if not targets and gf_results:
+        print("[*] No http_hosts for arjun. Using GF pattern matches as targets...")
+        for pattern, matches in gf_results.items():
+            if pattern in ["sqli", "xss", "ssrf", "idor", "lfi", "rce", "redirect"]:
+                targets.extend(matches[:15])  # top 15 matches per interesting pattern
+        targets = list(dict.fromkeys(targets))[:50]
+
+    # PIPELINE: Last resort - use dork results directly
+    if not targets and dork_results:
+        print("[*] No GF matches either. Using dork results as arjun targets...")
+        dork_urls = [r["url"] for r in dork_results if r.get("url", "").startswith(("http://", "https://"))]
+        targets = list(dict.fromkeys(dork_urls))[:50]
+
+    print(f"[*] Running arjun for hidden parameter discovery on {len(targets)} hosts...")
     arjun_results = []
     if not shutil.which("arjun"):
         print("[-] 'arjun' not found. Skipping arjun module.")
         return arjun_results
 
-    # Limit to top 50 unique hosts to avoid excessive scanning
-    targets = list(set(h["url"] for h in http_hosts))[:50]
+    if not targets:
+        print("[-] No targets for arjun. Skipping.")
+        return arjun_results
 
     for target in targets:
         try:
@@ -2231,9 +2348,7 @@ def generate_ghost_dashboard(target, cfg=None):
     dns_records = fetch_dns_records(target)
     harvest_data = fetch_emails_theharvester(target)
     co_hosted_domains = fetch_reverse_ip(target_ip) if target_ip else []
-    katana_endpoints = run_katana(target, resolved_hosts=resolved_hosts, passive=True)
-
-    # DorkEye-inspired Dork Engine
+    # DorkEye-inspired Dork Engine (run FIRST so results feed downstream pipeline)
     print("\n" + "="*55)
     print("  DORK ENGINE (DorkEye-inspired)")
     print("="*55)
@@ -2250,6 +2365,9 @@ def generate_ghost_dashboard(target, cfg=None):
     dork_map = dork_engine.get_dork_map()
     dork_by_severity = dork_engine.get_results_by_severity()
 
+    # PIPELINE: Passive katana now runs AFTER dork engine so it can use dork URLs as seeds
+    katana_endpoints = run_katana(target, resolved_hosts=resolved_hosts, passive=True, dork_results=dork_results)
+
     # subjack
     subjack_results = []
     if do_subjack:
@@ -2258,30 +2376,49 @@ def generate_ghost_dashboard(target, cfg=None):
     # cPanel/WHM Detection
     cpanel_data = detect_cpanel_services(target, active_probe=cpanel_probe)
 
-    # Active pipeline
-    naabu_results  = []
-    http_hosts     = []
-    nuclei_findings = []
-    gf_results = {}
-    arjun_results = []
+    # ═══════════════════════════════════════════════════════════
+    # PIPELINED ACTIVE RECON CHAIN
+    # ═══════════════════════════════════════════════════════════
+    # Data flow: DorkEngine → Katana → GF → Arjun → Nuclei
+    #            resolved_hosts → naabu → httpx ↗
+    # ═══════════════════════════════════════════════════════════
 
+    naabu_results   = []
+    http_hosts      = []
+    nuclei_findings = []
+    gf_results      = {}
+    arjun_results   = []
+
+    # Stage 1: Port scan (if active mode)
     if active and resolved_hosts:
         naabu_results = run_naabu(resolved_hosts, rate=rate)
-        http_hosts = run_httpx(resolved_hosts, naabu_results=naabu_results)
-        if http_hosts:
-            katana_endpoints = run_katana(target, http_hosts=http_hosts, passive=False)
 
+    # Stage 2: HTTP probing with fallback chain:
+    #   naabu ports → resolved hosts (https) → dork results
+    if active or do_nuclei or do_gf or do_arjun:
+        http_hosts = run_httpx(resolved_hosts, naabu_results=naabu_results, dork_results=dork_results)
+
+    # Stage 3: Active crawling with fallback:
+    #   http_hosts → dork results
+    if active and (http_hosts or dork_results):
+        katana_endpoints = run_katana(target, http_hosts=http_hosts, resolved_hosts=resolved_hosts, 
+                                       passive=False, dork_results=dork_results)
+
+    # Stage 4: GF pattern matching with fallback chain:
+    #   katana endpoints + wayback → dork results
     if do_gf:
-        gf_results = run_gf(katana_endpoints, discovered_wayback_urls)
+        gf_results = run_gf(katana_endpoints, discovered_wayback_urls, dork_results=dork_results)
 
-    if do_arjun and http_hosts:
-        arjun_results = run_arjun(http_hosts)
+    # Stage 5: Arjun parameter discovery with fallback chain:
+    #   http_hosts → GF interesting matches → dork results
+    if do_arjun:
+        arjun_results = run_arjun(http_hosts, dork_results=dork_results, gf_results=gf_results)
 
+    # Stage 6: Nuclei vulnerability scan with fallback chain:
+    #   katana endpoints → http_hosts → dork results
     if do_nuclei:
-        if not http_hosts and resolved_hosts:
-            print("[*] --nuclei requires httpx; running httpx first...")
-            http_hosts = run_httpx(resolved_hosts)
-        nuclei_findings = run_nuclei(http_hosts, katana_endpoints=katana_endpoints, rate=150)
+        nuclei_findings = run_nuclei(http_hosts, katana_endpoints=katana_endpoints, 
+                                      rate=150, dork_results=dork_results)
 
     # Build HTML
     html_content = build_html_dashboard(
@@ -2290,7 +2427,7 @@ def generate_ghost_dashboard(target, cfg=None):
         whois_info, dns_records, harvest_data, co_hosted_domains,
         naabu_results, http_hosts, katana_endpoints, gf_results,
         arjun_results, nuclei_findings, subjack_results, cpanel_data,
-        dork_results, dork_engine, dork_map
+        dork_results, dork_engine, dork_map, dork_by_severity
     )
 
     filename = f"ghost_dorks_{target.replace('.', '_')}.html"
@@ -2337,7 +2474,7 @@ def build_html_dashboard(target, safe_target, target_ip, all_subdomains, resolve
                          whois_info, dns_records, harvest_data, co_hosted_domains,
                          naabu_results, http_hosts, katana_endpoints, gf_results,
                          arjun_results, nuclei_findings, subjack_results, cpanel_data,
-                         dork_results, dork_engine, dork_map):
+                         dork_results, dork_engine, dork_map, dork_by_severity=None):
     """Build the complete HTML dashboard."""
     dork_by_severity = dork_engine.get_results_by_severity()
 
@@ -2470,6 +2607,13 @@ def build_html_dashboard(target, safe_target, target_ip, all_subdomains, resolve
                     {f' | cPanel/WHM: <strong style="color: var(--cpanel-orange);">{html.escape(cpanel_data["service_type"])}</strong> | Risk: <strong style="color: {"var(--cpanel-red)" if cpanel_data["risk_level"] == "CRITICAL" else "var(--nuclei-high)" if cpanel_data["risk_level"] == "HIGH" else "var(--cpanel-amber)" if cpanel_data["risk_level"] == "MEDIUM" else "var(--main-green)"}">{html.escape(cpanel_data["risk_level"])}</strong>' if cpanel_data["detected"] else ''}
                     {f' | Dork Results: <strong style="color: var(--dork-cyan);">{len(dork_results)}</strong>' if dork_results else ''}
                 </div>
+                <div style="margin-top:15px;padding:10px;background:#0a0a0a;border:1px solid #333;border-radius:5px;font-size:12px;color:#888;">
+                    <strong style="color:var(--main-green);">PIPELINE STATUS:</strong> 
+                    DorkEngine({len(dork_results)}) → Katana({len(katana_endpoints)}) → httpx({len(http_hosts)}) → 
+                    GF({len(gf_results)} patterns) → Arjun({sum(len(r["params"]) for r in arjun_results)} params) → 
+                    Nuclei({len(nuclei_findings)} findings)
+                    <br><span style="color:#555;">Data flows left→right. Each stage feeds the next. Fallbacks ensure pipeline continuity.</span>
+                </div>
             </header>
 
             <div class="controls">
@@ -2481,6 +2625,44 @@ def build_html_dashboard(target, safe_target, target_ip, all_subdomains, resolve
     """
 
     body_html = header_html
+
+    # Pipeline Status Section
+    body_html += f"""
+    <div class="category-section" style="border-color: var(--main-green);">
+        <h2 style="color: var(--main-green);">🔗 Integrated Pipeline Status</h2>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 15px;">
+            <div class="dork-stat-card">
+                <div class="dork-stat-value" style="color: var(--dork-cyan);">{len(dork_results)}</div>
+                <div class="dork-stat-label">DORK ENGINE<br><span style="font-size:9px;color:#555;">Seeds the pipeline</span></div>
+            </div>
+            <div class="dork-stat-card">
+                <div class="dork-stat-value" style="color: var(--katana-sky);">{len(katana_endpoints)}</div>
+                <div class="dork-stat-label">KATANA<br><span style="font-size:9px;color:#555;">Crawls dork URLs + hosts</span></div>
+            </div>
+            <div class="dork-stat-card">
+                <div class="dork-stat-value" style="color: var(--httpx-pink);">{len(http_hosts)}</div>
+                <div class="dork-stat-label">HTTPX<br><span style="font-size:9px;color:#555;">Probes naabu + dork hosts</span></div>
+            </div>
+            <div class="dork-stat-card">
+                <div class="dork-stat-value" style="color: var(--gf-purple);">{len(gf_results)}</div>
+                <div class="dork-stat-label">GF PATTERNS<br><span style="font-size:9px;color:#555;">Matches on katana + dorks</span></div>
+            </div>
+            <div class="dork-stat-card">
+                <div class="dork-stat-value" style="color: var(--arjun-blue);">{sum(len(r["params"]) for r in arjun_results)}</div>
+                <div class="dork-stat-label">ARJUN PARAMS<br><span style="font-size:9px;color:#555;">Discovers on GF matches + dorks</span></div>
+            </div>
+            <div class="dork-stat-card">
+                <div class="dork-stat-value" style="color: var(--nuclei-crit);">{len(nuclei_findings)}</div>
+                <div class="dork-stat-label">NUCLEI<br><span style="font-size:9px;color:#555;">Scans katana + httpx + dorks</span></div>
+            </div>
+        </div>
+        <div class="code-block" style="font-size:11px;">
+<strong>Data Flow:</strong> DorkEngine(492 dorks) → Katana(passive/active crawl) → httpx(port probe + dork hosts) → GF(pattern match) → Arjun(param discovery) → Nuclei(vuln scan)
+<strong>Fallback Chain:</strong> If naabu finds no HTTP ports → use resolved_hosts directly → use dork result URLs
+<strong>Integration:</strong> Each stage passes its output to the next. Empty results trigger fallback to upstream data sources.
+        </div>
+    </div>
+    """
 
     # Dork Engine Results Section
     if dork_results:
@@ -2769,16 +2951,6 @@ def build_html_dashboard(target, safe_target, target_ip, all_subdomains, resolve
         for w_url in discovered_wayback_urls:
             safe_w_url = html.escape(w_url)
             body_html += f'<div class="dork-item"><a href="{safe_w_url}" target="_blank" class="dork-text wayback-link">{safe_w_url}</a><button class="copy-btn" data-dork="{safe_w_url}" onclick="copyToClipboard(this.getAttribute(\'data-dork\'))">COPY</button></div>'
-        body_html += "</div></div>"
-
-    # Generated Dorks
-    for category, queries in dork_map.items():
-        body_html += f'<div class="category-section"><h2>{category}</h2><div class="dork-list">'
-        for q in queries:
-            encoded_q = urllib.parse.quote_plus(q) 
-            url = f"https://www.google.com/search?q={encoded_q}"
-            safe_q = html.escape(q).replace('"', '&quot;')
-            body_html += f'<div class="dork-item"><a href="{url}" target="_blank" class="dork-text">{html.escape(q)}</a><button class="copy-btn" data-dork="{safe_q}" onclick="copyToClipboard(this.getAttribute(\'data-dork\'))">COPY</button></div>'
         body_html += "</div></div>"
 
     # Footer with JavaScript
