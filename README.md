@@ -1,4 +1,4 @@
-# 🕵️ PROJECT GHOST ENGINE v2.0 (GhostRecon)
+# 🕵️ PROJECT GHOST ENGINE v2.0 (GhostDorks)
 
 > Advanced unified OSINT & cPanel/WHM reconnaissance engine with an optional full active scanning pipeline — featuring the **Project Ghost Dork Engine**, **gf pattern matching**, **arjun parameter discovery**, and **subjack subdomain takeover scanning**.
 
