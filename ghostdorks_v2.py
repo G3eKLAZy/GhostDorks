@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-GHOSTDORKS v3.0 — Unified OSINT & cPanel/WHM Reconnaissance Engine
-Created by: L4ZYG33K | Enhanced with cPanel CVE-2026-41940 Triage
+GHOSTRECON v1 — Unified OSINT & cPanel/WHM Reconnaissance Engine
+Created by: L4ZYG33K | Enhanced with Dork Engine + gf/arjun/subjack
 ================================================================================
 Passive Modules (always run):
   • Subdomain Enum (crt.sh, OTX, HackerTarget, subfinder)
@@ -15,6 +15,8 @@ Passive Modules (always run):
   • Katana Passive (Wayback/CommonCrawl)
   • cPanel/WHM Detection & Passive Fingerprinting
   • CVE-2026-41940 Patch Assessment
+  • subjack (subdomain takeover fingerprinting)
+  • gf (pattern matching on endpoints)
 
 Active Modules (--active):
   • dnsx resolution + takeover detection
@@ -22,12 +24,13 @@ Active Modules (--active):
   • httpx probing (title/server/tech/TLS)
   • katana active crawl
   • nuclei vulnerability scan
+  • arjun (hidden parameter discovery)
   • cPanel CVE-2026-41940 Remote Probe (WHM only)
 
 Usage:
-  python ghostdorks.py -d example.com
-  python ghostdorks.py -d example.com --active
-  python ghostdorks.py -d example.com --active --nuclei --cpanel-probe
+  python ghostreconv1.py -d example.com
+  python ghostreconv1.py -d example.com --active
+  python ghostreconv1.py -d example.com --active --nuclei --cpanel-probe --gf --arjun --subjack
 ================================================================================
 """
 
@@ -74,6 +77,276 @@ CPANEL_MIN_SIZE = 8000
 CPANEL_TIMEOUT = 15
 CPANEL_CONNECT_TIMEOUT = 8
 PROBE_TIMEOUT = 20
+
+# ─────────────────────────────────────────────
+#Ghost Dork Templates
+# ─────────────────────────────────────────────
+
+DORK_TEMPLATES = {
+    "🐱 Subdomain Recon": [
+        'site:*.{target}',
+        'site:*.{target} -www',
+        '"@{target}" -site:www.{target} -site:{target}',
+        'intitle:"index of" "parent directory" site:{target}',
+        'inurl:dmarc domain={target}',
+        'ext:txt {target} (vhost OR hostname OR nameserver)',
+        'filetype:env {target}',
+        'inurl:(admin | login | panel) site:*.{target}',
+        'site:*.{target} inurl:api',
+        'site:{target} inurl:staging',
+        'site:{target} inurl:dev',
+        'site:{target} inurl:test',
+        'site:*.{target} inurl:*.api',
+        'site:{target} inurl:mail',
+        'site:{target} inurl:ftp',
+        'site:{target} inurl:cdn',
+        'allintitle:"index of/admin"',
+        'allintitle:"index of/root"',
+        'allintitle:restricted filetype:mail',
+        'site:{target} inurl:vpn',
+    ],
+    "📁 Directory & File Exposure": [
+        'intitle:"index of" site:{target}',
+        'intitle:"index of /backup"',
+        'intitle:"index of /admin"',
+        'inurl:/db_backup OR inurl:/database_backup site:{target}',
+        'ext:sql | ext:dbf | ext:mdb | ext:ora site:{target}',
+        'filetype:log site:{target}',
+        'inurl:wp-config.php site:{target}',
+        'inurl:/.env site:{target}',
+        'intitle:"index of" +passwd site:{target}',
+        'intitle:"index of" +git site:{target}',
+        'intitle:"index of" +config site:{target}',
+        'inurl:sitemap.xml site:{target}',
+        'inurl:robots.txt site:{target}',
+        'intitle:"index of" +sql site:{target}',
+        'intitle:"index of" +backup site:{target}',
+        'inurl:/backup/ site:{target}',
+        'inurl:/dump/ site:{target}',
+    ],
+    "🔑 Secrets & Configs": [
+        'ext:env | ext:.env site:{target}',
+        'intext:"DB_PASSWORD" site:{target}',
+        'intext:"AWS_ACCESS_KEY_ID" site:{target}',
+        'filetype:json "api_key" site:{target}',
+        'inurl:.git/config site:{target}',
+        'intext:"DATABASE_URL" site:{target}',
+        'intext:"SLACK_BOT_TOKEN" site:{target}',
+        'ext:key site:{target}',
+        'ext:pem site:{target}',
+        'intext:"BEGIN RSA PRIVATE" site:{target}',
+        'filetype:pfx site:{target}',
+        'intext:"password" filetype:xml site:{target}',
+        'intext:"secret" filetype:conf site:{target}',
+        'intext:"token" filetype:json site:{target}',
+        'intext:"api_secret" site:{target}',
+        'intext:"client_secret" site:{target}',
+        'inurl:.env.{target}',
+        'intext:"-----BEGIN OPENSSH PRIVATE KEY-----" site:{target}',
+        'intext:"-----BEGIN PGP PRIVATE KEY BLOCK-----" site:{target}',
+    ],
+    "⚠️ Admin Panels & Auth": [
+        'inurl:admin/login.php site:{target}',
+        'inurl:wp-login.php site:{target}',
+        'intitle:"admin panel" | intitle:"control panel" site:{target}',
+        'intitle:"phpMyAdmin" site:{target}',
+        'inurl:cpanel site:{target}',
+        'intitle:"Jenkins" site:{target}',
+        'intitle:"Citrix" site:{target}',
+        'inurl:login site:{target}',
+        'inurl:signin site:{target}',
+        'inurl:dashboard site:{target}',
+        'inurl:portal site:{target}',
+        'inurl:administrator site:{target}',
+        'intitle:"login" "password" site:{target}',
+        'inurl:auth site:{target}',
+        'inurl:oauth site:{target}',
+        'inurl:saml site:{target}',
+    ],
+    "💥 Vulnerable Files & Errors": [
+        'intitle:"phpinfo()" site:{target}',
+        'inurl:/vendor/ site:{target}',
+        'intext:"sql syntax error" site:{target}',
+        'intext:"Warning: include" site:{target}',
+        'inurl:phpshell site:{target}',
+        'inurl:webshell site:{target}',
+        'inurl:backdoor site:{target}',
+        'intext:"Fatal error" site:{target}',
+        'intext:"Stack trace" site:{target}',
+        'intext:"syntax error" site:{target}',
+        'intext:"Connection refused" site:{target}',
+        'intext:"403 Forbidden" site:{target}',
+        'intitle:"Apache2 Ubuntu Default Page" site:{target}',
+        'intitle:"IIS Windows Server" site:{target}',
+        'intitle:"Welcome to nginx" site:{target}',
+        'inurl:phpmyadmin site:{target}',
+        'inurl:adminer.php site:{target}',
+    ],
+    "🔌 APIs & Documentation": [
+        'inurl:api/ | inurl:rest/ | inurl:v1/ site:{target}',
+        'inurl:swagger | inurl:redoc site:{target}',
+        'site:*.{target} (inurl:swagger OR inurl:api-docs)',
+        'inurl:graphql site:{target}',
+        'inurl:openapi.json site:{target}',
+        'inurl:api-docs site:{target}',
+        'inurl:postman site:{target}',
+        'inurl:graphql site:{target}',
+        'intitle:"Swagger UI" site:{target}',
+        'intext:"paths" "swagger" site:{target}',
+        'inurl:/api/v1/ site:{target}',
+        'inurl:/api/v2/ site:{target}',
+        'inurl:/rest/ site:{target}',
+        'inurl:/graphql/ site:{target}',
+        'inurl:/soap/ site:{target}',
+        'inurl:/wsdl site:{target}',
+    ],
+    "🚨 Error & Debug Leaks": [
+        'intext:"Warning: mysql" site:{target}',
+        'intext:"Stack trace" site:{target}',
+        'intext:"Fatal error" site:{target}',
+        'intext:"syntax error" site:{target}',
+        'intext:"Connection refused" site:{target}',
+        'intext:"403 Forbidden" site:{target}',
+        'intext:"500 Internal Server Error" site:{target}',
+        'intext:"Debug mode" site:{target}',
+        'intext:"Traceback" site:{target}',
+        'intext:"Exception" site:{target}',
+        'intext:"NullPointerException" site:{target}',
+        'intext:"django" "debug" site:{target}',
+        'intext:"laravel" "debug" site:{target}',
+        'intext:"symfony" "debug" site:{target}',
+        'intext:"php error" site:{target}',
+    ],
+    "📄 Documents & Leaks": [
+        'filetype:pdf site:{target}',
+        'filetype:doc | filetype:docx site:{target}',
+        'filetype:xls | filetype:xlsx site:{target}',
+        'intext:"confidential" site:{target}',
+        'intext:"internal use only" site:{target}',
+        'site:{target} "employee handbook" filetype:pdf',
+        'intext:"password" filetype:xls site:{target}',
+        'intext:"classified" site:{target}',
+        'intext:"proprietary" site:{target}',
+        'intext:"NDA" site:{target}',
+        'intext:"do not distribute" site:{target}',
+        'filetype:ppt | filetype:pptx site:{target}',
+        'filetype:csv site:{target}',
+        'filetype:txt site:{target}',
+    ],
+    "🕳️ Paste & Git Leaks": [
+        'site:pastebin.com "{target}"',
+        'site:github.com "{target}" intext:"password"',
+        'site:*.stackexchange.com {target} password',
+        'site:gist.github.com {target}',
+        'site:github.com "{target}" "api_key"',
+        'site:github.com "{target}" "secret"',
+        'site:github.com "{target}" "token"',
+        'site:gitlab.com "{target}"',
+        'site:bitbucket.org "{target}"',
+        'site:pastebin.com "{target}" password',
+        'site:controlc.com "{target}"',
+        'site:ideone.com "{target}"',
+    ],
+    "🔗 Takeover & Third-Party": [
+        'inurl:herokuapp.com site:{target}',
+        'inurl:*.cloudfront.net site:{target}',
+        'inurl:github.io {target}',
+        'inurl:s3.amazonaws.com {target}',
+        'inurl:azurewebsites.net site:{target}',
+        'inurl:firebaseapp.com site:{target}',
+        'inurl:netlify.app site:{target}',
+        'inurl:vercel.app site:{target}',
+        'inurl:fastly.net site:{target}',
+        'inurl:bitbucket.io site:{target}',
+        'inurl:repl.co site:{target}',
+        'inurl:glitch.me site:{target}',
+        'inurl:webflow.io site:{target}',
+        'inurl:readme.io site:{target}',
+    ],
+    "☁️ Cloud Storage & Buckets": [
+        'site:s3.amazonaws.com "{target}"',
+        'site:storage.googleapis.com {target}',
+        'site:blob.core.windows.net {target}',
+        'inurl:bucket site:{target}',
+        'site:s3.amazonaws.com "{target}" "index of"',
+        'site:storage.googleapis.com "{target}"',
+        'site:amazonaws.com "{target}"',
+        'site:cloudfront.net "{target}"',
+        'inurl:s3.amazonaws.com inurl:{target}',
+        'inurl:googleapis.com inurl:{target}',
+        'intext:"bucket" "{target}" site:amazonaws.com',
+    ],
+    "🏗️ Dev / Test / Staging": [
+        'site:{target} inurl:staging',
+        'site:{target} inurl:dev',
+        'site:{target} inurl:test',
+        'site:{target} inurl:sandbox',
+        'site:{target} inurl:localhost',
+        'site:{target} inurl:beta',
+        'site:{target} inurl:alpha',
+        'site:{target} inurl:qa',
+        'site:{target} inurl:uat',
+        'site:{target} inurl:preprod',
+        'site:{target} inurl:preview',
+        'site:{target} inurl:demo',
+        'site:dev.{target}',
+        'site:staging.{target}',
+        'site:test.{target}',
+    ],
+    "💼 Social & Employee Intel": [
+        'site:linkedin.com/in/ "{target}"',
+        'site:linkedin.com "{target}" (engineer OR admin)',
+        'site:twitter.com {target}',
+        '"@{target}" site:twitter.com',
+        'site:facebook.com "{target}"',
+        'site:instagram.com "{target}"',
+        'site:youtube.com "{target}"',
+        'site:reddit.com "{target}"',
+        'site:medium.com "{target}"',
+        'site:about.me "{target}"',
+    ],
+    "🎛️ cPanel/WHM & Hosting": [
+        'inurl:cpanel site:{target}',
+        'inurl:whm site:{target}',
+        'inurl:webmail site:{target}',
+        'inurl:roundcube site:{target}',
+        'inurl:squirrelmail site:{target}',
+        'inurl:horde site:{target}',
+        'inurl:2083 site:{target}',
+        'inurl:2087 site:{target}',
+        'intitle:"cPanel" site:{target}',
+        'intitle:"WebHost Manager" site:{target}',
+    ],
+    "🗄️ Database & Backup Leaks": [
+        'ext:sql site:{target}',
+        'ext:dump site:{target}',
+        'ext:bak site:{target}',
+        'ext:backup site:{target}',
+        'ext:mdb site:{target}',
+        'ext:sqlite site:{target}',
+        'ext:db site:{target}',
+        'inurl:phpmyadmin site:{target}',
+        'inurl:adminer site:{target}',
+        'intext:"database dump" site:{target}',
+        'intext:"mysql dump" site:{target}',
+        'intext:"pg_dump" site:{target}',
+        'intext:"mongodb" "dump" site:{target}',
+    ],
+    "📡 IoT & Network Devices": [
+        'intitle:"Router" site:{target}',
+        'intitle:"Switch" site:{target}',
+        'intitle:"Firewall" site:{target}',
+        'intitle:"VPN" site:{target}',
+        'intitle:"Network Camera" site:{target}',
+        'intitle:"Webcam" site:{target}',
+        'inurl:axis-cgi site:{target}',
+        'intitle:"Live View / - AXIS" site:{target}',
+        'inurl:viewerframe?mode= site:{target}',
+        'intitle:"DVR" site:{target}',
+        'intitle:"NAS" site:{target}',
+        'inurl:printer site:{target}',
+    ],
+}
 
 # ─────────────────────────────────────────────
 # Utility Functions
@@ -618,7 +891,144 @@ def run_nuclei(http_hosts, katana_endpoints=None, rate=150):
 
 
 # ─────────────────────────────────────────────
-# NEW: cPanel/WHM Reconnaissance Modules
+# NEW: gf, arjun, subjack Integrations
+# ─────────────────────────────────────────────
+
+def run_gf(endpoints, wayback_urls=None):
+    """Run gf pattern matching on katana endpoints + wayback URLs."""
+    print(f"[*] Running gf pattern matching on {len(endpoints)} endpoints...")
+    gf_results = {}
+    if not shutil.which("gf"):
+        print("[-] 'gf' not found. Skipping gf module.")
+        return gf_results
+
+    # Common gf patterns to check
+    patterns = ["xss", "sqli", "ssrf", "redirect", "aws-keys", "s3-buckets", 
+                "debug-pages", "base64", "jwt", "idor", "lfi", "rce", 
+                "takeovers", "upload-fields", "php-errors", "git", "cors"]
+
+    # Combine endpoints and wayback URLs
+    all_urls = [e["url"] for e in endpoints]
+    if wayback_urls:
+        all_urls.extend(wayback_urls)
+    all_urls = sorted(set(all_urls))
+
+    if not all_urls:
+        print("[-] No URLs to analyze with gf.")
+        return gf_results
+
+    try:
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_gf_', delete=False)
+        tmp.write('\n'.join(all_urls))
+        tmp.close()
+
+        for pattern in patterns:
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", f"cat {tmp.name} | gf {pattern}"],
+                    capture_output=True, text=True, timeout=60
+                )
+                matches = [line.strip() for line in proc.stdout.strip().splitlines() if line.strip()]
+                if matches:
+                    gf_results[pattern] = matches
+                    print(f"    [+] gf {pattern}: {len(matches)} matches")
+            except Exception as e:
+                continue
+
+        os.unlink(tmp.name)
+        total = sum(len(v) for v in gf_results.values())
+        print(f"[+] gf analysis complete. {total} total pattern matches across {len(gf_results)} patterns.")
+    except Exception as e:
+        print(f"[-] gf error: {e}")
+    return gf_results
+
+def run_arjun(http_hosts):
+    """Run arjun hidden parameter discovery on live HTTP hosts."""
+    print(f"[*] Running arjun for hidden parameter discovery on {len(http_hosts)} hosts...")
+    arjun_results = []
+    if not shutil.which("arjun"):
+        print("[-] 'arjun' not found. Skipping arjun module.")
+        return arjun_results
+
+    # Limit to top 50 unique hosts to avoid excessive scanning
+    targets = list(set(h["url"] for h in http_hosts))[:50]
+
+    for target in targets:
+        try:
+            proc = subprocess.run(
+                ["arjun", "-u", target, "-oJ", "-o", "/tmp/arjun_ghostdorks.json", "-t", "20"],
+                capture_output=True, text=True, timeout=120
+            )
+            if os.path.exists("/tmp/arjun_ghostdorks.json"):
+                with open("/tmp/arjun_ghostdorks.json", 'r') as f:
+                    data = json.load(f)
+                for entry in data:
+                    arjun_results.append({
+                        "url": entry.get("url", target),
+                        "params": entry.get("params", []),
+                        "method": entry.get("method", "GET"),
+                        "type": entry.get("type", "query")
+                    })
+                os.unlink("/tmp/arjun_ghostdorks.json")
+        except Exception as e:
+            continue
+
+    total_params = sum(len(r["params"]) for r in arjun_results)
+    print(f"[+] arjun found {total_params} hidden parameters across {len(arjun_results)} hosts.")
+    return arjun_results
+
+def run_subjack(subdomains):
+    """Run subjack subdomain takeover check on all discovered subdomains."""
+    print(f"[*] Running subjack on {len(subdomains)} subdomains...")
+    subjack_results = []
+    if not shutil.which("subjack"):
+        print("[-] 'subjack' not found. Skipping subjack module.")
+        return subjack_results
+
+    try:
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='ghostdorks_subjack_', delete=False)
+        tmp.write('\n'.join(subdomains))
+        tmp.close()
+
+        proc = subprocess.run(
+            ["subjack", "-w", tmp.name, "-v", "-t", "100", "-timeout", "30", "-ssl"],
+            capture_output=True, text=True, timeout=300
+        )
+        os.unlink(tmp.name)
+
+        for line in proc.stdout.strip().splitlines():
+            if "[Vulnerable]" in line or "dead" in line.lower() or "takeover" in line.lower():
+                parts = line.split()
+                host = parts[0] if parts else ""
+                service = ""
+                status = "CONFIRMED" if "[Vulnerable]" in line else "POTENTIAL"
+
+                # Extract service name if present
+                for p in parts:
+                    if any(s in p.lower() for s in ["github", "heroku", "aws", "azure", "fastly", "shopify", "pantheon", "tumblr", "wordpress", "teamwork", "helpjuice", "helpscout", "feedpress", "surge", "webflow", "kajabi", "jetbrains", "cloudfront", "zendesk", "readme"]):
+                        service = p
+                        break
+
+                subjack_results.append({
+                    "host": host,
+                    "service": service,
+                    "status": status,
+                    "raw": line
+                })
+
+        confirmed = sum(1 for r in subjack_results if r["status"] == "CONFIRMED")
+        print(f"[+] subjack found {len(subjack_results)} takeovers ({confirmed} confirmed, {len(subjack_results)-confirmed} potential).")
+    except subprocess.TimeoutExpired:
+        print("[-] subjack timed out.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted subjack (Ctrl+C).")
+    except Exception as e:
+        print(f"[-] subjack error: {e}")
+    return subjack_results
+
+
+# ─────────────────────────────────────────────
+# cPanel/WHM Reconnaissance Modules
 # (Ported from cpanel_scan_v2.sh)
 # ─────────────────────────────────────────────
 
@@ -953,11 +1363,14 @@ def generate_ghost_dashboard(target, cfg=None):
     do_nuclei = cfg.get("nuclei", False)
     rate     = cfg.get("rate", 1000)
     cpanel_probe = cfg.get("cpanel_probe", False)
+    do_gf    = cfg.get("gf", False)
+    do_arjun = cfg.get("arjun", False)
+    do_subjack = cfg.get("subjack", False)
     safe_target = html.escape(target)
 
     print("\n" + "="*55)
-    print("  🕵️  PROJECT GHOST ENGINE — Unified Recon Pipeline")
-    print("  cPanel/WHM CVE-2026-41940 Triage Module Integrated")
+    print("  🕵️  PROJECT GHOST ENGINE — Unified Recon Pipeline v4.0")
+    print("  DorkEye Dork Engine | gf | arjun | subjack | cPanel Triage")
     print("="*55)
     if active:
         print("  ⚠️  ACTIVE MODE enabled (naabu + httpx + katana)")
@@ -965,6 +1378,12 @@ def generate_ghost_dashboard(target, cfg=None):
         print("  💀  NUCLEI enabled — vulnerability scanning active")
     if cpanel_probe:
         print("  🎯  CPANEL PROBE enabled — CVE-2026-41940 active test")
+    if do_gf:
+        print("  🔎  GF enabled — pattern matching on endpoints")
+    if do_arjun:
+        print("  🕵️  ARJUN enabled — hidden parameter discovery")
+    if do_subjack:
+        print("  🎣  SUBJACK enabled — subdomain takeover scanning")
     print("="*55 + "\n")
 
     # ── Passive baseline ────────────────────
@@ -994,6 +1413,11 @@ def generate_ghost_dashboard(target, cfg=None):
     co_hosted_domains = fetch_reverse_ip(target_ip) if target_ip else []
     katana_endpoints = run_katana(target, resolved_hosts=resolved_hosts, passive=True)
 
+    # ── NEW: subjack (always runs if enabled) ──
+    subjack_results = []
+    if do_subjack:
+        subjack_results = run_subjack(all_subdomains)
+
     # ── NEW: cPanel/WHM Detection (always runs as passive) ──
     cpanel_data = detect_cpanel_services(target, active_probe=cpanel_probe)
 
@@ -1001,6 +1425,8 @@ def generate_ghost_dashboard(target, cfg=None):
     naabu_results  = []
     http_hosts     = []
     nuclei_findings = []
+    gf_results = {}
+    arjun_results = []
 
     if active and resolved_hosts:
         naabu_results = run_naabu(resolved_hosts, rate=rate)
@@ -1008,90 +1434,41 @@ def generate_ghost_dashboard(target, cfg=None):
         if http_hosts:
             katana_endpoints = run_katana(target, http_hosts=http_hosts, passive=False)
 
+    # ── NEW: gf pattern matching ──
+    if do_gf:
+        gf_results = run_gf(katana_endpoints, discovered_wayback_urls)
+
+    # ── NEW: arjun parameter discovery ──
+    if do_arjun and http_hosts:
+        arjun_results = run_arjun(http_hosts)
+
     if do_nuclei:
         if not http_hosts and resolved_hosts:
             print("[*] --nuclei requires httpx; running httpx first...")
             http_hosts = run_httpx(resolved_hosts)
         nuclei_findings = run_nuclei(http_hosts, katana_endpoints=katana_endpoints, rate=150)
 
-    # ── Dork Map ────────────────────────────
-    dork_map = {
-        "🐱 Subdomain Enum": [
-            f'site:*.{target}', f'site:*.{target} -www', f'"@{target}" -site:www.{target} -site:{target}',
-            f'intitle:"index of" "parent directory" site:{target}", f"inurl:dmarc:domain={target}',
-            f'ext:txt {target} (vhost OR hostname OR nameserver)", f"filetype:env {target}',
-            f'inurl:(admin | login | panel) site:*.{target}", f"site:*.{target} inurl:api',
-            f'site:{target} inurl:staging", f"site:{target} inurl:dev", f"site:{target} inurl:test',
-            f'site:*.{target} inurl:*.api", f"site:{target} inurl:mail", f"site:{target} inurl:ftp',
-            f'site:{target} inurl:cdn", f"allintitle:"index of/admin"", f"allintitle:"index of/root"',
-            f'allintitle:restricted filetype:mail", f"site:{target} inurl:vpn'
-        ],
-        "📁 Directory/File": [
-            f'intitle:"index of" site:{target}", f"intitle:"index of /backup"", f"intitle:"index of /admin"',
-            f'inurl:/db_backup OR inurl:/database_backup site:{target}", f"ext:sql | ext:dbf | ext:mdb | ext:ora site:{target}',
-            f'filetype:log site:{target}", f"inurl:wp-config.php site:{target}", f"inurl:/.env site:{target}',
-            f'intitle:"index of" +passwd site:{target}", f"intitle:"index of" +git site:{target}',
-            f'intitle:"index of" +config site:{target}", f"inurl:sitemap.xml site:{target}", f"inurl:robots.txt site:{target}'
-        ],
-        "🔑 Secrets & Configs": [
-            f'ext:env | ext:.env site:{target}", f"intext:"DB_PASSWORD" site:{target}',
-            f'intext:"AWS_ACCESS_KEY_ID" site:{target}", f"filetype:json "api_key" site:{target}',
-            f'inurl:.git/config site:{target}", f"intext:"DATABASE_URL" site:{target}',
-            f'intext:"SLACK_BOT_TOKEN" site:{target}", f"ext:key site:{target}", f"ext:pem site:{target}',
-            f'intext:"BEGIN RSA PRIVATE" site:{target}", f"filetype:pfx site:{target}'
-        ],
-        "⚠️ Admin Panels": [
-            f'inurl:admin/login.php site:{target}", f"inurl:wp-login.php site:{target}',
-            f'intitle:"admin panel" | intitle:"control panel" site:{target}", f"intitle:"phpMyAdmin" site:{target}',
-            f'inurl:cpanel site:{target}", f"intitle:"Jenkins" site:{target}", f"intitle:"Citrix" site:{target}'
-        ],
-        "💥 Vulnerable Files": [
-            f'intitle:"phpinfo()" site:{target}", f"inurl:/vendor/ site:{target}',
-            f'intext:"sql syntax error" site:{target}", f"intext:"Warning: include" site:{target}',
-            f'inurl:phpshell site:{target}", f"inurl:webshell site:{target}", f"inurl:backdoor site:{target}'
-        ],
-        "🔌 APIs & Swagger": [
-            f'inurl:api/ | inurl:rest/ | inurl:v1/ site:{target}", f"inurl:swagger | inurl:redoc site:{target}',
-            f'site:*.{target} (inurl:swagger OR inurl:api-docs)", f"inurl:graphql site:{target}',
-            f"inurl:openapi.json site:{target}"
-        ],
-        "🚨 Error & Debug": [
-            f'intext:"Warning: mysql" site:{target}", f"intext:"Stack trace" site:{target}',
-            f'intext:"Fatal error" site:{target}", f"intext:"syntax error" site:{target}',
-            f'intext:"Connection refused" site:{target}", f"intext:"403 Forbidden" site:{target}'
-        ],
-        "📄 Documents": [
-            f'filetype:pdf site:{target}", f"filetype:doc | filetype:docx site:{target}',
-            f'filetype:xls | filetype:xlsx site:{target}", f"intext:"confidential" site:{target}',
-            f'intext:"internal use only" site:{target}", f"site:{target} "employee handbook" filetype:pdf'
-        ],
-        "🕳️ Leaks": [
-            f'site:pastebin.com "{target}"', f'site:github.com "{target}" intext:"password"',
-            f'site:*.stackexchange.com {target} password", f"site:gist.github.com {target}'
-        ],
-        "🔗 Takeover": [
-            f'inurl:herokuapp.com site:{target}", f"inurl:*.cloudfront.net site:{target}',
-            f'inurl:github.io {target}", f"inurl:s3.amazonaws.com {target}'
-        ],
-        "☁️ Cloud": [
-            f'site:s3.amazonaws.com "{target}"', f'site:storage.googleapis.com {target}',
-            f'site:blob.core.windows.net {target}", f"inurl:bucket site:{target}'
-        ],
-        "🏗️ Dev/Test": [
-            f'site:{target} inurl:staging", f"site:{target} inurl:dev", f"site:{target} inurl:test',
-            f'site:{target} inurl:sandbox", f"site:{target} inurl:localhost'
-        ],
-        "💼 Social": [
-            f'site:linkedin.com/in/ "{target}"', f'site:linkedin.com "{target}" (engineer OR admin)',
-            f'site:twitter.com {target}', f'"@{target}" site:twitter.com'
-        ]
-    }
+    # ── Dork Map Generation ─────────────────
+    dork_map = {}
 
-    if discovered_subdomains:
-        sub_dorks = [f"site:{sub}" for sub in discovered_subdomains]
-        new_dork_map = {"🌐 Discovered Subdomains (Passive OSINT)": sub_dorks}
-        new_dork_map.update(dork_map)
-        dork_map = new_dork_map
+    # Add discovered subdomains as their own category
+    if all_subdomains:
+        sub_dorks = [f"site:{sub}" for sub in all_subdomains[:50]]
+        dork_map["🌐 Discovered Subdomains"] = sub_dorks
+
+    # Build dorks from templates with target interpolation
+    for category, templates in DORK_TEMPLATES.items():
+        dork_map[category] = []
+        for template in templates:
+            # Replace {target} with actual domain
+            dork = template.replace("{target}", target)
+            dork_map[category].append(dork)
+
+    # Add subdomain-specific variants for key categories
+    if all_subdomains:
+        for sub in all_subdomains[:20]:
+            dork_map["🐱 Subdomain Recon"].append(f"site:{sub}")
+            dork_map["🏗️ Dev / Test / Staging"].append(f"site:{sub}")
 
     # ── HTML Generation ─────────────────────
     html_content = f"""
@@ -1099,9 +1476,9 @@ def generate_ghost_dashboard(target, cfg=None):
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>GhostDorks v3.0 - {safe_target}</title>
+        <title>GhostDorks v4.0 - {safe_target}</title>
         <style>
-            :root {{ --main-green: #00ff41; --bg-black: #0d0d0d; --card-bg: #1a1a1a; --blue: #00ccff; --wayback-yellow: #ffb800; --shodan-red: #ff3333; --whois-cyan: #00e5ff; --dns-purple: #b388ff; --harvest-orange: #ff9100; --reverse-teal: #1de9b6; --dnsx-lime: #c6ff00; --httpx-pink: #ff4081; --katana-sky: #40c4ff; --nuclei-crit: #ff1744; --nuclei-high: #ff6d00; --nuclei-med: #ffd600; --nuclei-low: #69f0ae; --cpanel-orange: #ff6f00; --cpanel-red: #d50000; --cpanel-amber: #ffab00; }}
+            :root {{ --main-green: #00ff41; --bg-black: #0d0d0d; --card-bg: #1a1a1a; --blue: #00ccff; --wayback-yellow: #ffb800; --shodan-red: #ff3333; --whois-cyan: #00e5ff; --dns-purple: #b388ff; --harvest-orange: #ff9100; --reverse-teal: #1de9b6; --dnsx-lime: #c6ff00; --httpx-pink: #ff4081; --katana-sky: #40c4ff; --nuclei-crit: #ff1744; --nuclei-high: #ff6d00; --nuclei-med: #ffd600; --nuclei-low: #69f0ae; --cpanel-orange: #ff6f00; --cpanel-red: #d50000; --cpanel-amber: #ffab00; --gf-purple: #e040fb; --arjun-blue: #448aff; --subjack-red: #ff5252; }}
             body {{ font-family: 'Courier New', monospace; background-color: var(--bg-black); color: var(--main-green); margin: 0; padding: 20px; }}
             .container {{ max-width: 1200px; margin: auto; }}
             header {{ border-bottom: 2px solid var(--main-green); padding-bottom: 20px; margin-bottom: 30px; text-align: center; }}
@@ -1159,13 +1536,35 @@ def generate_ghost_dashboard(target, cfg=None):
             .badge-unknown {{ border-color: #888; color: #888; background: rgba(136,136,136,0.1); }}
             .badge-nopatch {{ border-color: var(--cpanel-amber); color: var(--cpanel-amber); background: rgba(255,171,0,0.1); }}
             .code-block {{ background: #111; border: 1px solid #333; padding: 10px; font-size: 12px; color: #aaa; overflow-x: auto; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }}
+
+            /* gf styles */
+            .gf-banner {{ background: linear-gradient(90deg, rgba(224,64,251,0.1), rgba(68,138,255,0.1)); border: 1px solid var(--gf-purple); padding: 15px; margin-bottom: 20px; border-radius: 5px; }}
+            .gf-banner h2 {{ color: var(--gf-purple); border-bottom: 1px solid var(--gf-purple); }}
+            .gf-pattern {{ margin-bottom: 15px; }}
+            .gf-pattern-name {{ color: var(--gf-purple); font-weight: bold; font-size: 14px; margin-bottom: 5px; }}
+            .gf-match {{ color: #aaa; font-size: 12px; padding: 3px 0; border-bottom: 1px solid #1a1a1a; }}
+            .gf-match:last-child {{ border-bottom: none; }}
+
+            /* arjun styles */
+            .arjun-banner {{ background: linear-gradient(90deg, rgba(68,138,255,0.1), rgba(0,204,255,0.1)); border: 1px solid var(--arjun-blue); padding: 15px; margin-bottom: 20px; border-radius: 5px; }}
+            .arjun-banner h2 {{ color: var(--arjun-blue); border-bottom: 1px solid var(--arjun-blue); }}
+            .arjun-host {{ margin-bottom: 12px; }}
+            .arjun-host-name {{ color: var(--arjun-blue); font-weight: bold; font-size: 14px; margin-bottom: 5px; }}
+            .arjun-param {{ display: inline-block; padding: 2px 8px; margin: 2px; border-radius: 10px; font-size: 11px; background: rgba(68,138,255,0.15); border: 1px solid var(--arjun-blue); color: var(--arjun-blue); }}
+
+            /* subjack styles */
+            .subjack-banner {{ background: linear-gradient(90deg, rgba(255,82,82,0.1), rgba(255,23,68,0.1)); border: 1px solid var(--subjack-red); padding: 15px; margin-bottom: 20px; border-radius: 5px; }}
+            .subjack-banner h2 {{ color: var(--subjack-red); border-bottom: 1px solid var(--subjack-red); }}
+            .subjack-confirmed {{ color: var(--subjack-red); font-weight: bold; }}
+            .subjack-potential {{ color: var(--cpanel-amber); font-weight: bold; }}
+            .subjack-item {{ padding: 8px 12px; border-left: 3px solid #333; margin: 4px 0; background: #0d0d0d; font-size: 13px; }}
         </style>
     </head>
     <body>
         <div class="container">
             <header>
-                <h1>🕵️ PROJECT GHOST ENGINE v3.0</h1>
-                <h3>created by: L4ZYG33K | cPanel Triage Module</h3>
+                <h1>🕵️ PROJECT GHOST ENGINE v4.0</h1>
+                <h3>created by: L4ZYG33K | DorkEye + gf + arjun + subjack + cPanel</h3>
                 <p>Target: <strong style="color: #fff;">{safe_target}</strong> {f"({target_ip})" if target_ip else ""}</p>
                 <div class="stats">
                     Subdomains: <strong style="color: var(--main-green);">{len(all_subdomains)}</strong> |
@@ -1179,6 +1578,9 @@ def generate_ghost_dashboard(target, cfg=None):
                     HTTP Hosts: <strong style="color: var(--httpx-pink);">{len(http_hosts)}</strong> |
                     Endpoints: <strong style="color: var(--katana-sky);">{len(katana_endpoints)}</strong> |
                     Nuclei Findings: <strong style="color: var(--nuclei-crit);">{len(nuclei_findings)}</strong>
+                    {f' | GF Patterns: <strong style="color: var(--gf-purple);">{len(gf_results)}</strong>' if gf_results else ''}
+                    {f' | Arjun Params: <strong style="color: var(--arjun-blue);">{sum(len(r["params"]) for r in arjun_results)}</strong>' if arjun_results else ''}
+                    {f' | Subjack: <strong style="color: var(--subjack-red);">{len(subjack_results)}</strong>' if subjack_results else ''}
                     {f' | cPanel/WHM: <strong style="color: var(--cpanel-orange);">{html.escape(cpanel_data["service_type"])}</strong> | Risk: <strong style="color: {"var(--cpanel-red)" if cpanel_data["risk_level"] == "CRITICAL" else "var(--nuclei-high)" if cpanel_data["risk_level"] == "HIGH" else "var(--cpanel-amber)" if cpanel_data["risk_level"] == "MEDIUM" else "var(--main-green)"}">{html.escape(cpanel_data["risk_level"])}</strong>' if cpanel_data["detected"] else ''}
                 </div>
             </header>
@@ -1191,7 +1593,7 @@ def generate_ghost_dashboard(target, cfg=None):
             <div id="dorkContainer">
     """
 
-    # ── cPanel/WHM Section (NEW) ──
+    # ── cPanel/WHM Section ──
     if cpanel_data["detected"]:
         risk_class = {
             "CRITICAL": "risk-critical",
@@ -1244,6 +1646,53 @@ def generate_ghost_dashboard(target, cfg=None):
 
             {f'<div style="margin-top: 12px;"><strong style="color: #888;">Body Snippet:</strong><div class="code-block">{html.escape(cpanel_data["body_snippet"][:1500])}</div></div>' if cpanel_data["body_snippet"] else ''}
         </div>"""
+
+    # ── subjack Section ──
+    if subjack_results:
+        confirmed = [r for r in subjack_results if r["status"] == "CONFIRMED"]
+        potential = [r for r in subjack_results if r["status"] != "CONFIRMED"]
+        html_content += f"""
+        <div class="category-section subjack-banner">
+            <h2>🎣 Subjack Takeover Results — {len(subjack_results)} found ({len(confirmed)} confirmed, {len(potential)} potential)</h2>
+            <div>"""
+        if confirmed:
+            html_content += '<div style="margin-bottom: 12px;"><strong style="color: var(--subjack-red);">CONFIRMED VULNERABLE:</strong><br>'
+            for r in confirmed[:50]:
+                svc = f" [{html.escape(r['service'])}]" if r["service"] else ""
+                html_content += f'<div class="subjack-item"><span class="subjack-confirmed">⚠️ {html.escape(r["host"])}{svc}</span><br><span style="color:#555;font-size:11px;">{html.escape(r["raw"])}</span></div>'
+            html_content += '</div>'
+        if potential:
+            html_content += '<div><strong style="color: var(--cpanel-amber);">POTENTIAL TAKEOVERS:</strong><br>'
+            for r in potential[:50]:
+                svc = f" [{html.escape(r['service'])}]" if r["service"] else ""
+                html_content += f'<div class="subjack-item"><span class="subjack-potential">? {html.escape(r["host"])}{svc}</span><br><span style="color:#555;font-size:11px;">{html.escape(r["raw"])}</span></div>'
+            html_content += '</div>'
+        html_content += '</div></div>'
+
+    # ── gf Section ──
+    if gf_results:
+        html_content += f"""
+        <div class="category-section gf-banner">
+            <h2>🔎 GF Pattern Matches — {len(gf_results)} patterns, {sum(len(v) for v in gf_results.values())} total matches</h2>
+            <div>"""
+        for pattern, matches in gf_results.items():
+            html_content += f'<div class="gf-pattern"><div class="gf-pattern-name">🎯 {html.escape(pattern.upper())} ({len(matches)} matches)</div>'
+            for match in matches[:30]:
+                safe_match = html.escape(match)
+                html_content += f'<div class="gf-match"><a href="{safe_match}" target="_blank" style="color:#aaa;text-decoration:none;">{safe_match}</a></div>'
+            html_content += '</div>'
+        html_content += '</div></div>'
+
+    # ── arjun Section ──
+    if arjun_results:
+        html_content += f"""
+        <div class="category-section arjun-banner">
+            <h2>🕵️ Hidden Parameters (Arjun) — {sum(len(r["params"]) for r in arjun_results)} params across {len(arjun_results)} hosts</h2>
+            <div>"""
+        for entry in arjun_results[:50]:
+            params_html = " ".join(f'<span class="arjun-param">{html.escape(p)}</span>' for p in entry["params"])
+            html_content += f'<div class="arjun-host"><div class="arjun-host-name">{html.escape(entry["url"])} <span style="color:#555;font-size:12px;">({html.escape(entry["method"])} / {html.escape(entry["type"])})</span></div>{params_html}</div>'
+        html_content += '</div></div>'
 
     # ── WHOIS ──
     if whois_info and whois_info.get("registrar") != "N/A":
@@ -1368,19 +1817,19 @@ def generate_ghost_dashboard(target, cfg=None):
             html_content += f'<div style="margin-bottom:12px;"><strong style="color:#888;">Sensitive Files ({len(sensitive_eps)}):</strong><br>'
             for e in sensitive_eps[:50]:
                 su = html.escape(e["url"])
-                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text" style="color:var(--shodan-red);">{su}</a><button class="copy-btn" onclick="copyToClipboard(\'{su}\')">COPY</button></div>'
+                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text" style="color:var(--shodan-red);">{su}</a><button class="copy-btn" onclick="copyToClipboard('{su}')">COPY</button></div>'
             html_content += '</div>'
         if api_eps:
             html_content += f'<div style="margin-bottom:12px;"><strong style="color:#888;">API Endpoints ({len(api_eps)}):</strong><br>'
             for e in api_eps[:50]:
                 su = html.escape(e["url"])
-                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text" style="color:var(--katana-sky);">{su}</a><button class="copy-btn" onclick="copyToClipboard(\'{su}\')">COPY</button></div>'
+                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text" style="color:var(--katana-sky);">{su}</a><button class="copy-btn" onclick="copyToClipboard('{su}')">COPY</button></div>'
             html_content += '</div>'
         if other_eps:
             html_content += f'<div><strong style="color:#888;">Other Endpoints ({len(other_eps)}):</strong><br>'
             for e in other_eps[:100]:
                 su = html.escape(e["url"])
-                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text">{su}</a><button class="copy-btn" onclick="copyToClipboard(\'{su}\')">COPY</button></div>'
+                html_content += f'<div class="dork-item" style="margin:3px 0;"><a href="{su}" target="_blank" class="dork-text">{su}</a><button class="copy-btn" onclick="copyToClipboard('{su}')">COPY</button></div>'
             html_content += '</div>'
         html_content += '</div>'
 
@@ -1521,6 +1970,7 @@ def generate_ghost_dashboard(target, cfg=None):
         "subdomains": all_subdomains,
         "resolved_hosts": resolved_hosts,
         "takeover_candidates": takeover_candidates,
+        "subjack_results": subjack_results,
         "wayback_urls": discovered_wayback_urls,
         "open_ports": open_ports,
         "cves": vulns,
@@ -1530,10 +1980,13 @@ def generate_ghost_dashboard(target, cfg=None):
         "naabu_ports": naabu_results,
         "http_hosts": http_hosts,
         "katana_endpoints": katana_endpoints,
+        "gf_results": gf_results,
+        "arjun_results": arjun_results,
         "nuclei_findings": nuclei_findings,
         "cpanel_recon": cpanel_data,
         "whois": whois_info,
         "dns": dns_records,
+        "dorks": dork_map,
         "generated_at": datetime.now().isoformat()
     }
     with open(json_filename, "w", encoding="utf-8") as jf:
@@ -1545,7 +1998,7 @@ def generate_ghost_dashboard(target, cfg=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="PROJECT GHOST ENGINE v3.0 — Unified OSINT & cPanel/WHM Reconnaissance",
+        description="PROJECT GHOST ENGINE v4.0 — Unified OSINT & cPanel/WHM Reconnaissance",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1555,8 +2008,11 @@ Examples:
   With active scanning:
     python ghostdorks.py -d example.com --active
 
-  Full nuclear mode + cPanel probe:
-    python ghostdorks.py -d example.com --active --nuclei --cpanel-probe
+  Full nuclear mode + all new modules:
+    python ghostdorks.py -d example.com --active --nuclei --cpanel-probe --gf --arjun --subjack
+
+  Stealth mode with new tools:
+    python ghostdorks.py -d example.com --gf --subjack --rate 300
 
   Throttle active tools:
     python ghostdorks.py -d example.com --active --rate 300
@@ -1570,6 +2026,12 @@ Examples:
     parser.add_argument("--cpanel-probe", action="store_true",
         help="Enable active CVE-2026-41940 probe against WHM /json-api/version endpoint. "
              "Only use with explicit authorization.")
+    parser.add_argument("--gf", action="store_true",
+        help="Enable gf pattern matching on katana endpoints and wayback URLs.")
+    parser.add_argument("--arjun", action="store_true",
+        help="Enable arjun hidden parameter discovery on live HTTP hosts.")
+    parser.add_argument("--subjack", action="store_true",
+        help="Enable subjack subdomain takeover scanning on all discovered subdomains.")
     parser.add_argument("--rate", type=int, default=1000, metavar="N",
         help="Rate limit for active tools. Default: 1000. Lower for stealth (e.g. 300).")
     args = parser.parse_args()
@@ -1581,6 +2043,9 @@ Examples:
             "nuclei":  args.nuclei,
             "rate":    args.rate,
             "cpanel_probe": args.cpanel_probe,
+            "gf": args.gf,
+            "arjun": args.arjun,
+            "subjack": args.subjack,
         })
     else:
         print("[!] Domain cannot be empty.")
