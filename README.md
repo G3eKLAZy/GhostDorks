@@ -1,6 +1,8 @@
-# 🕵️ PROJECT GHOST ENGINE v2.0 (GhostDorks)
+# 🕵️ PROJECT GHOST ENGINE v2.0-Piped (GhostDorks)
 
-> Advanced unified OSINT & cPanel/WHM reconnaissance engine with an optional full active scanning pipeline — featuring the **Project Ghost Dork Engine**, **gf pattern matching**, **arjun parameter discovery**, and **subjack subdomain takeover scanning**.
+> Advanced unified OSINT & cPanel/WHM reconnaissance engine with a **fully piped active scanning pipeline** — featuring the **Project Ghost Dork Engine**, **gf pattern matching**, **arjun parameter discovery**, and **subjack subdomain takeover scanning**.
+>
+> **v2.0-Piped**: Dork Engine results now feed into GF, Arjun, and Nuclei via automatic fallback chains. No more zero-result dead ends when Wayback times out or naabu finds only cPanel ports.
 
 ---
 
@@ -38,17 +40,17 @@ All results are compiled into a **self-contained, color-coded, searchable HTML d
 
 ### 🟡 Active Mode (`--active` flag — Light traffic, looks like a browser)
 
-| Module | Tool | What It Collects |
-|--------|------|-----------------|
-| Port Scanning | `naabu` | Top-1000 ports across all resolved subdomains |
-| HTTP Probing | `httpx` | Live HTTP services, status codes, titles, server headers, tech stack |
-| Web Crawling | `katana` (active) | Deep endpoint discovery, JS parsing, form extraction |
+| Module | Tool | What It Collects | Piped From |
+|--------|------|-----------------|------------|
+| Port Scanning | `naabu` | Top-1000 ports across all resolved subdomains | dnsx resolved hosts |
+| HTTP Probing | `httpx` | Live HTTP services, status codes, titles, server headers, tech stack | **naabu** → resolved hosts → **dork results** |
+| Web Crawling | `katana` (active) | Deep endpoint discovery, JS parsing, form extraction | **httpx hosts** + **dork results** |
 
 ### 🔴 Nuclear Mode (`--nuclei` flag — Active exploitation probes)
 
-| Module | Tool | What It Collects |
-|--------|------|-----------------|
-| Vulnerability Scanning | `nuclei` | Exposures, misconfigurations, subdomain takeovers — severity-ranked |
+| Module | Tool | What It Collects | Piped From |
+|--------|------|-----------------|------------|
+| Vulnerability Scanning | `nuclei` | Exposures, misconfigurations, subdomain takeovers — severity-ranked | **katana** → httpx → **dork results** |
 
 ### 🎯 cPanel Active Probe (`--cpanel-probe` flag)
 
@@ -71,16 +73,20 @@ All results are compiled into a **self-contained, color-coded, searchable HTML d
 
 ### 🆕 GF Integration (`--gf` flag)
 
-Runs `gf` pattern matching on all katana endpoints and Wayback URLs for:
+Runs `gf` pattern matching on all katana endpoints, Wayback URLs, and **dork result URLs** for:
 - xss, sqli, ssrf, redirect, aws-keys, s3-buckets, debug-pages
 - base64, jwt, idor, lfi, rce, takeovers, upload-fields
 - php-errors, git, cors
+
+**Pipeline behavior:** If katana returns 0 endpoints, GF automatically falls back to dork result URLs.
 
 ### 🆕 Arjun Integration (`--arjun` flag)
 
 Discovers hidden HTTP parameters on live hosts using `arjun`:
 - Scans up to 50 unique HTTP hosts
 - Outputs discovered parameters with method and type
+
+**Pipeline behavior:** If httpx returns 0 hosts, Arjun falls back to GF interesting matches (SQLi, XSS, IDOR, etc.), then to dork result URLs.
 
 ### 🆕 Subjack Integration (`--subjack` flag)
 
@@ -91,6 +97,8 @@ Scans all discovered subdomains for takeover vulnerabilities:
 ---
 
 ## 🔗 Pipeline Architecture
+
+**v2.0-Piped**: Tools now feed into each other with automatic fallback chains. No more zero-result dead ends.
 
 ```
                     ┌─ crt.sh / OTX / HackerTarget ─┐
@@ -103,16 +111,41 @@ TARGET DOMAIN ──►   ├─ subfinder (40+ sources)       ├──► MERG
                     ┌─────────┴──────────────────────────────┐
                     │ [passive]                              │ [--active]
                     ▼                                        ▼
-              katana -ps                                naabu (port scan)
-              Wayback CDX                                     │
-              cPanel/WHM detect                          httpx (HTTP probe)
-              WHOIS / DNS / Shodan                              │
-              theHarvester / Reverse IP                   katana (active crawl)
-              Dork Engine (ddgs)                                │
-              subjack (takeovers)                        [--nuclei]
-              gf (patterns)                                   ▼
-              arjun (params)                         nuclei (vuln scan 💀)
-                    │                                           │
+              Dork Engine (ddgs)                        naabu (port scan)
+              ├─ 492 dorks, 20 categories                      │
+              ├─ Pattern analysis (PII/secrets/vulns)           ▼
+              ├─ Severity ranking                         httpx (HTTP probe)
+              └─ Checkpoint/resume                          ├─ naabu ports
+                    │                                       ├─ resolved hosts (https)
+                    │                                       └─ dork result URLs [FALLBACK]
+                    │                                               │
+                    ├───────────────────────────────────────────────┘
+                    │
+                    ▼
+              katana (passive + active)
+              ├─ Wayback / CommonCrawl
+              ├─ dork result URLs as seeds
+              └─ active crawl on httpx hosts
+                    │
+                    ├───────────────────────────────────────────────┐
+                    │                                               │
+                    ▼                                               ▼
+              gf (pattern matching)                          arjun (params)
+              ├─ katana endpoints                            ├─ httpx hosts
+              ├─ wayback URLs                                ├─ GF interesting matches
+              └─ dork result URLs [FALLBACK]                 └─ dork result URLs [FALLBACK]
+                    │
+                    ▼
+              nuclei (vulnerability scan 💀)
+              ├─ katana endpoints
+              ├─ httpx hosts
+              └─ dork result URLs [FALLBACK]
+                    │
+              cPanel/WHM detect
+              WHOIS / DNS / Shodan
+              theHarvester / Reverse IP
+              subjack (takeovers)
+                    │
                     └───────────────────────────────────────────┘
                                               │
                                               ▼
@@ -121,6 +154,20 @@ TARGET DOMAIN ──►   ├─ subfinder (40+ sources)       ├──► MERG
                                 │   JSON Summary           │
                                 └─────────────────────────┘
 ```
+
+### Fallback Chain Behavior
+
+When a stage produces zero results, the pipeline automatically feeds upstream data forward:
+
+| Stage | Primary Input | Fallback Input | Fallback Input |
+|-------|--------------|----------------|----------------|
+| **httpx** | naabu ports | resolved hosts (with `https://`) | dork result URLs |
+| **katana** | http_hosts | resolved hosts | dork result URLs |
+| **gf** | katana + wayback | — | dork result URLs |
+| **arjun** | http_hosts | GF interesting matches | dork result URLs |
+| **nuclei** | katana endpoints | http_hosts | dork result URLs |
+
+This ensures that even if `naabu` finds only cPanel ports (`2082`, `2083`) or Wayback times out, the **222 dork results** still seed the entire active pipeline.
 
 ---
 
@@ -169,6 +216,91 @@ The generated HTML dashboard includes (in order):
 15. 🕰️ Archived Sensitive Files (Wayback)
 16. 🌐 Discovered Subdomains
 17. 📂 400+ Google Dork Categories
+
+---
+
+## 🔗 Pipeline Integration (v2.0-Piped)
+
+### Why Piping Matters
+
+In the original v2.0, each tool ran as a standalone module. If one tool returned zero results, downstream tools would skip entirely — creating "dead ends" in the reconnaissance chain. Common failure modes:
+
+- **Wayback Machine times out** → katana passive returns 0 URLs → GF skips → Arjun skips → Nuclei skips
+- **naabu finds only cPanel ports** (`2082`, `2083`) → httpx whitelist blocks them → 0 HTTP hosts → everything downstream dies
+- **Dork Engine finds 222 URLs** → but they only go to the dashboard, never feed active tools
+
+### The Solution: Upstream Fallbacks
+
+Every active tool now accepts `dork_results` as a fallback parameter. The execution order ensures dork results are available before any active tool runs:
+
+```python
+# New execution order in generate_ghost_dashboard()
+1. DorkEngine.run()              # 492 dorks → 222 URLs
+2. katana(passive, dork_results) # Wayback + dork URLs as seeds
+3. naabu(resolved_hosts)         # port scan
+4. httpx(naabu, resolved, dorks) # probe with 3-tier fallback
+5. katana(active, http_hosts, dorks) # crawl with dork fallback
+6. gf(katana, wayback, dorks)    # pattern match with dork fallback
+7. arjun(http_hosts, gf, dorks)  # param discovery with 3-tier fallback
+8. nuclei(http_hosts, katana, dorks) # vuln scan with 3-tier fallback
+```
+
+### Fallback Chain Details
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         HTTPX FALLBACKS                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Tier 1: naabu_results (ports 80, 443, 8080, 8443, 2082, 2083…) │
+│  Tier 2: resolved_hosts with https:// prefix                     │
+│  Tier 3: dork_result URLs (extract host from URL)                │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        KATANA FALLBACKS                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Passive: resolved_hosts + dork URLs (top 30) as seed list       │
+│  Active:  http_hosts + dork URLs (top 20) as seed list           │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                          GF FALLBACKS                            │
+├─────────────────────────────────────────────────────────────────┤
+│  Primary: katana_endpoints + wayback_urls                        │
+│  Fallback: dork_result URLs (all HTTP/HTTPS URLs)                │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        ARJUN FALLBACKS                           │
+├─────────────────────────────────────────────────────────────────┤
+│  Tier 1: http_hosts (live HTTP services from httpx)              │
+│  Tier 2: GF interesting matches (sqli, xss, idor, lfi, rce…)    │
+│  Tier 3: dork_result URLs (top 50 unique hosts)                  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                       NUCLEI FALLBACKS                           │
+├─────────────────────────────────────────────────────────────────┤
+│  Tier 1: katana_endpoints (crawled URLs)                         │
+│  Tier 2: http_hosts (live services from httpx)                   │
+│  Tier 3: dork_result URLs (all HTTP/HTTPS URLs, deduplicated)    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Port Whitelist Expansion
+
+The original `valid_http_ports` only included standard web ports (`80`, `443`, `8080`…). cPanel/WHM services run on non-standard ports that were being filtered out:
+
+```python
+# Before (caused 0 httpx results on cPanel targets)
+valid_http_ports = {80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 8081, 9000}
+
+# After (includes cPanel/WHM/Webmail ports)
+valid_http_ports = {80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 8081, 9000,
+                    2082, 2083, 2086, 2087, 2095, 2096, 2077, 2078, 2079}
+```
+
+This ensures `httpx` probes cPanel login pages, webmail, and WHM interfaces — not just standard web servers.
 
 ---
 
@@ -255,15 +387,22 @@ python ghostdorks_v2.py -d target.com --dork-resume
 python ghostdorks_v2.py -d target.com --active --gf --arjun --subjack
 ```
 
-### Full Recon — Everything Enabled
+### Full Recon — Everything Enabled (Piped Pipeline)
 ```bash
 python ghostdorks_v2.py -d target.com --active --nuclei --cpanel-probe --gf --arjun --subjack --dork-stealth
 ```
+> **Note:** In piped mode, Dork Engine results (222 URLs) automatically feed into GF, Arjun, and Nuclei if primary sources are empty. No more zero-result dead ends.
 
 ### Throttled / Stealth Rate
 ```bash
 python ghostdorks_v2.py -d target.com --active --nuclei --rate 300
 ```
+
+### Force Dork Results into Active Pipeline (even if naabu/httpx fail)
+```bash
+python ghostdorks_v2.py -d target.com --active --nuclei --gf --arjun --dork-stealth
+```
+> Even if the target only has cPanel ports (2083) or Wayback times out, the 222 dork URLs will seed GF, Arjun, and Nuclei.
 
 ---
 
@@ -277,14 +416,14 @@ options:
   --active              Enable active scanning: naabu + httpx + katana.
                         Sends packets directly to target.
   --nuclei              Enable nuclei vulnerability scanning.
-                        Requires --active or will auto-run httpx first.
+                        Auto-falls back to dork results if no HTTP hosts.
   --cpanel-probe        Enable active CVE-2026-41940 probe against WHM
                         /json-api/version endpoint. ONLY use with explicit
                         authorization.
-  --gf                  Enable gf pattern matching on katana endpoints
-                        and wayback URLs.
+  --gf                  Enable gf pattern matching on katana endpoints,
+                        wayback URLs, and dork results (fallback).
   --arjun               Enable arjun hidden parameter discovery on live
-                        HTTP hosts.
+                        HTTP hosts. Falls back to GF matches, then dork URLs.
   --subjack             Enable subjack subdomain takeover scanning on all
                         discovered subdomains.
   --rate N              Rate limit for active tools. Default: 1000.
@@ -302,6 +441,15 @@ options:
   --dork-resume         Resume interrupted dork session from checkpoint.
   --no-dork-checkpoint  Disable session checkpointing.
 ```
+
+### Pipeline Behavior Notes
+
+| Flag | Piped From | Fallback Chain |
+|------|-----------|----------------|
+| `--gf` | katana + wayback | → dork results |
+| `--arjun` | httpx hosts | → GF matches → dork results |
+| `--nuclei` | katana endpoints | → httpx hosts → dork results |
+| `--active` | naabu → httpx → katana | dork results feed all stages |
 
 ---
 
@@ -321,8 +469,10 @@ The JSON summary now includes:
 - `arjun_results` — Hidden parameters per host
 - `subjack_results` — Takeover findings with status and service
 - `cpanel_recon` — Full cPanel/WHM triage object
+- `pipeline_status` — Per-stage counters showing data flow (dorks → katana → httpx → gf → arjun → nuclei)
+- `pipeline_status` — Per-stage counters showing data flow (dorks → katana → httpx → gf → arjun → nuclei)
 
-### Sample Terminal Output (v2.0)
+### Sample Terminal Output (v2.0-Piped)
 ```
 ================================================================================
 GHOSTRECON v2 — Unified OSINT & cPanel/WHM Reconnaissance Engine
@@ -350,16 +500,24 @@ Created by: L4ZYG33K | Project Ghost Dork Engine
 [!!!] RISK LEVEL: CRITICAL (score: 10)
       ACTION REQUIRED: Assume compromise risk. Firewall 2083/2087 immediately.
 
-[*] DorkEngine initialized: 412 dorks across 20 categories
+[*] DorkEngine initialized: 492 dorks across 23 categories
 [*] Mode: STEALTH | Rate: 300 | Max results/dork: 50
 [*] Checkpoint: .checkpoints/a3f7b2c1d8e5.pkl
 
-[ Dork 1/412 ]  Ctrl+C -> skip  |  Double Ctrl+C -> quit
+[ Dork 1/492 ]  Ctrl+C -> skip  |  Double Ctrl+C -> quit
 [*] Searching: site:example.com inurl:id=...
 [+] Found 3 results [low:3]
+... (466 dorks later) ...
+[+] DorkEngine complete: 492/492 dorks
+[+] Total unique URLs: 222 | Patterns: 156
 
-[*] Querying Wayback Machine for exposed files on example.com...
-[+] Successfully extracted 23 archived URLs from Wayback Machine.
+[*] Running katana [passive (Wayback/CommonCrawl)] for endpoint discovery...
+[*] Enriching with 30 dork result URLs as seeds...
+[-] Wayback Machine query timed out.
+[-] No sensitive archived files found on Wayback Machine.
+[+] katana discovered 0 endpoint(s) from archives.
+[+] katana discovered 18 endpoint(s) from dork URL seeds.
+
 [*] Querying Shodan InternetDB for ports on 192.0.2.15...
 [+] Found 4 open ports and 2 vulnerabilities.
 [*] Running WHOIS lookup for example.com...
@@ -370,29 +528,50 @@ Created by: L4ZYG33K | Project Ghost Dork Engine
 [+] theHarvester found: 5 emails, 18 hosts, 3 IPs
 [*] Running reverse IP lookup for 192.0.2.15...
 [+] Found 7 domains co-hosted on 192.0.2.15.
-[*] Running katana [passive (Wayback/CommonCrawl)] for endpoint discovery...
-[+] katana discovered 138 endpoint(s).
+
+══════════════════════════════════════════════════════════════════
+  PIPELINED ACTIVE RECON CHAIN
+══════════════════════════════════════════════════════════════════
+
 [*] Running naabu port scan on 54 hosts (rate=300)...
 [+] naabu found 12 open port(s) across all hosts.
+
 [*] Running httpx to probe live HTTP services...
-[+] httpx found 8 live HTTP endpoint(s).
+[*] naabu found no standard HTTP ports. Falling back to resolved hosts with https:// prefix...
+[+] httpx found 6 live HTTP endpoint(s) from resolved hosts.
+[*] No resolved hosts to probe. Using dork engine results as httpx seeds...
+[+] httpx found 4 additional endpoint(s) from dork results.
+[+] httpx total: 10 live HTTP endpoint(s).
+
 [*] Running katana [active crawl] for endpoint discovery...
+[*] No http_hosts for active katana. Using dork results as seeds...
 [+] katana discovered 45 endpoint(s).
-[*] Running gf pattern matching on 183 endpoints...
-[+] gf analysis complete. 47 total pattern matches across 8 patterns.
-[*] Running arjun for hidden parameter discovery on 8 hosts...
-[+] arjun found 15 hidden parameters across 4 hosts.
+
+[*] Running gf pattern matching on 63 URLs...
+[*] No katana/wayback endpoints. Using dork results as GF input...
+[+] gf analysis complete. 12 total pattern matches across 4 patterns.
+
+[*] Running arjun for hidden parameter discovery on 10 hosts...
+[*] No http_hosts for arjun. Using GF pattern matches as targets...
+[+] arjun found 8 hidden parameters across 3 hosts.
+
 [*] Running subjack on 89 subdomains...
 [+] subjack found 3 takeovers (1 confirmed, 2 potential).
-[*] Running nuclei vulnerability scan (rate=150)...
-[+] nuclei found 3 findings (0 critical, 1 high).
 
-[+] DorkEngine complete: 412/412 dorks
-[+] Total unique URLs: 847 | Patterns: 156
+[*] Running nuclei vulnerability scan (rate=150)...
+[*] No HTTP hosts or katana endpoints. Using dork results as nuclei targets...
+[+] nuclei found 5 findings (1 critical, 2 high).
 
 [+] Ghost Dashboard Generated : ghost_dorks_example_com.html
 [+] JSON Summary Saved        : ghost_dorks_example_com.json
 ```
+
+**Key differences in piped mode:**
+- Dork Engine runs **first** (before katana passive)
+- Wayback timeout no longer kills the pipeline — dork URLs seed katana
+- httpx finds hosts via **fallback chain** even when naabu only finds cPanel ports
+- GF, Arjun, and Nuclei all execute using **dork results** when primary inputs are empty
+- Dashboard shows live pipeline status with per-stage counters
 
 ---
 
@@ -406,8 +585,28 @@ The Dork Engine queries third-party search engines (DuckDuckGo). Use `--dork-ste
 
 ---
 
+## 📜 Changelog
+
+### v2.0-Piped (Current)
+- **Pipeline Integration**: Dork Engine results now feed GF, Arjun, and Nuclei via automatic fallback chains
+- **Expanded Port Whitelist**: Added cPanel/WHM/Webmail ports (`2082`, `2083`, `2086`, `2087`, `2095`, `2096`, `2077-2079`) to httpx probing
+- **Execution Reorder**: Dork Engine now runs before active tools so results are available for fallback
+- **3-Tier Fallbacks**: Each active tool has multiple fallback inputs (e.g., httpx: naabu → resolved_hosts → dork_results)
+- **Dashboard Pipeline Status**: New HTML section showing live per-stage counters and data flow documentation
+- **Katana Seeding**: Both passive and active katana now use dork result URLs as seed targets
+
+### v2.0 (Original)
+- Added Project Ghost Dork Engine with DuckDuckGo integration
+- Added YAML template-based dork generation (492 dorks, 23 categories)
+- Added pattern analysis (PII, secrets, vulnerability indicators)
+- Added session checkpoint/resume system
+- Added gf, arjun, and subjack integrations
+- Added cPanel/WHM detection and CVE-2026-41940 assessment
+
 ## 👨‍💻 Credits
 
 Created by: **L4ZYG33K**
 
 v2.0 Dork Engine, gf, arjun, and subjack integrations by Project Ghost Dork Engine
+
+v2.0-Piped pipeline architecture and fallback chains by community contribution
